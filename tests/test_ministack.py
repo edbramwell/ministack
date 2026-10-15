@@ -61,7 +61,8 @@ def test_ministack_health_endpoints():
     assert resp_health.status == 200
     data_health = json.loads(resp_health.read())
     assert "services" in data_health
-    assert type(data_health["auth_enabled"]) is bool
+    assert data_health["auth"] in {"enabled", "disabled"}
+    assert "auth_enabled" not in data_health
     assert "s3" in data_health["services"]
     assert data_health["edition"] == "light"
 
@@ -1239,7 +1240,7 @@ def test_ministack_auth_unset_is_permissive(tmp_path):
                     time.sleep(0.1)
             else:
                 pytest.fail(f"Default-mode server did not start: {log_path.read_text()}")
-            assert health["auth_enabled"] is False
+            assert health["auth"] == "disabled"
             with closing(boto3.client(
                 "s3", endpoint_url=endpoint, region_name="us-east-1",
                 aws_access_key_id="unregistered-auth-contract-key", aws_secret_access_key="dummy-secret",

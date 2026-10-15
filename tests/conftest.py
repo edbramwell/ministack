@@ -124,18 +124,19 @@ def auth_enabled():
         pytest.fail("Auth contracts require AUTH=true or AUTH=false.", pytrace=False)
     try:
         with urllib.request.urlopen(f"{ENDPOINT.rstrip('/')}/_ministack/health", timeout=5) as response:
-            actual = json.load(response).get("auth_enabled")
+            actual = json.load(response).get("auth")
     except (OSError, ValueError) as exc:
         pytest.fail(f"Cannot read MiniStack auth mode at {ENDPOINT}: {exc}", pytrace=False)
-    if type(actual) is not bool:
-        pytest.fail("MiniStack health response lacks boolean auth_enabled; restart with current code.", pytrace=False)
-    if actual != (expected == "true"):
+    if actual not in ("enabled", "disabled"):
+        pytest.fail("MiniStack health response lacks auth=enabled/disabled; restart with current code.", pytrace=False)
+    expected_state = "enabled" if expected == "true" else "disabled"
+    if actual != expected_state:
         pytest.fail(
             f"Auth mode mismatch: tests expect AUTH={expected}, but {ENDPOINT} reports "
-            f"AUTH={str(actual).lower()}. Restart the server with the expected mode.",
+            f"auth={actual}. Restart the server with the expected mode.",
             pytrace=False,
         )
-    return actual
+    return actual == "enabled"
 
 
 @pytest.fixture(autouse=True)

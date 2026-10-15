@@ -233,6 +233,8 @@ def test_list_buckets_without_permission(auth_enabled, iam_user):
 Every marked test verifies that the server's health response reports the expected
 mode, even if it doesn't request `auth_enabled` explicitly. The fixture observes
 configuration; it never changes the server's mode. A mismatch fails the test.
+Health reports `auth` as `enabled` or `disabled`; `auth_enabled` exposes that
+state as a boolean to tests.
 
 For local runs, start the server in one terminal:
 
