@@ -61,6 +61,7 @@ def test_ministack_health_endpoints():
     assert resp_health.status == 200
     data_health = json.loads(resp_health.read())
     assert "services" in data_health
+    assert type(data_health["auth_enabled"]) is bool
     assert "s3" in data_health["services"]
     assert data_health["edition"] == "light"
 
@@ -1196,3 +1197,59 @@ def test_failed_docker_hub_pull_falls_back_to_a_mirror_and_keeps_the_name(monkey
     with pytest.raises(APIError, match="registry unavailable"):
         ImageCollection.pull(None, "public.ecr.aws/lambda/python:3.12")
     assert pulled == ["public.ecr.aws/lambda/python:3.12"]
+
+
+@pytest.mark.auth_contract
+def test_ministack_auth_unset_is_permissive(tmp_path):
+    """Exercise a fresh HTTP server without AUTH, even in the strict CI job."""
+    import socket
+    import subprocess
+    import sys
+    import time
+    import urllib.request
+    from contextlib import closing
+    from pathlib import Path
+
+    import boto3
+    from botocore.config import Config
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    endpoint = f"http://127.0.0.1:{port}"
+    env = {**os.environ, "IOT_MTLS_ENABLED": "0", "PERSIST_STATE": "0", "S3_PERSIST": "0"}
+    env.pop("AUTH", None)
+    env.pop("LOCALSTACK_PERSISTENCE", None)
+    log_path = tmp_path / "auth-unset.log"
+    with log_path.open("w") as log:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "hypercorn", "ministack.app:app", "--bind", f"127.0.0.1:{port}"],
+            cwd=Path(__file__).resolve().parents[1], env=env, stdout=log, stderr=subprocess.STDOUT,
+        )
+        try:
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    pytest.fail(f"Default-mode server exited: {log_path.read_text()}")
+                try:
+                    with urllib.request.urlopen(f"{endpoint}/_ministack/health", timeout=1) as response:
+                        health = json.load(response)
+                    break
+                except OSError:
+                    time.sleep(0.1)
+            else:
+                pytest.fail(f"Default-mode server did not start: {log_path.read_text()}")
+            assert health["auth_enabled"] is False
+            with closing(boto3.client(
+                "s3", endpoint_url=endpoint, region_name="us-east-1",
+                aws_access_key_id="unregistered-auth-contract-key", aws_secret_access_key="dummy-secret",
+                config=Config(retries={"total_max_attempts": 1}, connect_timeout=5, read_timeout=5),
+            )) as client:
+                assert "Buckets" in client.list_buckets()
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
