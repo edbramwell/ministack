@@ -27695,7 +27695,7 @@ def test_cfn_apigateway_deployment_update_in_place_and_replacement(cfn, apigw_v1
 
 def test_cfn_iot_thing_group_missing_parent_fails_and_unmodelled_properties_are_accepted(cfn, iot_client):
     """A parent that does not exist fails the stack with the service's own
-    ResourceNotFoundException; QueryString (dynamic groups), which the service
+    InvalidRequestException; QueryString (dynamic groups), which the service
     does not model, is accepted without effect."""
     uid = _uuid_mod.uuid4().hex[:8]
     stack_name = f"cfn-thing-group-edge-{uid}"
@@ -27706,7 +27706,7 @@ def test_cfn_iot_thing_group_missing_parent_fails_and_unmodelled_properties_are_
     try:
         stack = _wait_stack(cfn, stack_name)
         assert stack["StackStatus"] == "ROLLBACK_COMPLETE", stack.get("StackStatusReason")
-        assert "ResourceNotFoundException" in _stack_event_reasons(cfn, stack_name)
+        assert "InvalidRequestException" in _stack_event_reasons(cfn, stack_name)
         with pytest.raises(ClientError):
             iot_client.describe_thing_group(thingGroupName=f"cfn-tg-orphan-{uid}")
     finally:

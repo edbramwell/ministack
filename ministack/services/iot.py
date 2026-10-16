@@ -529,7 +529,6 @@ _NOT_FOUND_MESSAGES = {
     "ThingType": "Thing Type {account}:{name} not found.",
     "ThingGroup": "ThingGroup {account}:{name} not found.",
     "UpdateThingGroup": "Group {name} does not exist",
-    "CreateThingGroup": "Cannot create group using non-existing group as parent : {name}",
     "ThingGroupMember": "Cannot find requested thing group for accountId: {account} and thing group name: {name}",
     "Certificate": "CertificateId {name} does not exist",
     "CACertificate": "Requested CA Certificate does not exist.",
@@ -1744,7 +1743,9 @@ def _create_thing_group(name: str, payload: dict) -> tuple:
     attr_payload = props.get("attributePayload") or {}
     parent = payload.get("parentGroupName")
     if parent and parent not in _thing_groups:
-        return _error_not_found("CreateThingGroup", parent)
+        return error_response_json(
+            "InvalidRequestException", f"Cannot create group using non-existing group as parent : {parent}", 400
+        )
     record = {
         "thingGroupName": name,
         "thingGroupId": new_uuid(),

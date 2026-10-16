@@ -540,8 +540,6 @@ _NO_PRINCIPAL = "because the principal does not exist in your account"
     ("describe_thing_group", {"thingGroupName": "{nogroup}"}, "ThingGroup {account}:{nogroup} not found."),
     ("update_thing_group", {"thingGroupName": "{nogroup}", "thingGroupProperties": {}},
      "Group {nogroup} does not exist"),
-    ("create_thing_group", {"thingGroupName": "{nothing}", "parentGroupName": "{nogroup}"},
-     "Cannot create group using non-existing group as parent : {nogroup}"),
     ("list_things_in_thing_group", {"thingGroupName": "{nogroup}"},
      "Cannot find requested thing group for accountId: {account} and thing group name: {nogroup}"),
     ("add_thing_to_thing_group", {"thingGroupName": "{nogroup}", "thingName": "{thing}"},
@@ -603,6 +601,15 @@ def test_iot_not_found_messages(iot_client, operation, kwargs, message):
         iot_client.delete_policy(policyName=policy)
         iot_client.delete_thing_group(thingGroupName=group)
         iot_client.delete_thing(thingName=thing)
+
+
+def test_iot_create_thing_group_with_unknown_parent_is_invalid(iot_client):
+    nogroup = _unique("nogroup")
+    with pytest.raises(ClientError) as ei:
+        iot_client.create_thing_group(thingGroupName=_unique("group"), parentGroupName=nogroup)
+    error = ei.value.response["Error"]
+    assert (ei.value.response["ResponseMetadata"]["HTTPStatusCode"], error["Code"], error["Message"]) == (
+        400, "InvalidRequestException", f"Cannot create group using non-existing group as parent : {nogroup}")
 
 
 def test_iot_update_thing_increments_version(iot_client):
