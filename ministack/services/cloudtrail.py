@@ -591,7 +591,7 @@ def _start_logging(body: dict):
     if error:
         return error
     trail["IsLogging"] = True
-    trail["_StartedAt"] = round(time.time(), 3)
+    trail["_StartedAt"] = int(time.time())
     return _ok({})
 
 
@@ -604,7 +604,7 @@ def _stop_logging(body: dict):
         return error
     # Only a running trail records a stop; stopping a stopped trail keeps the last time.
     if trail.get("IsLogging", True):
-        trail["_StoppedAt"] = round(time.time(), 3)
+        trail["_StoppedAt"] = int(time.time())
     trail["IsLogging"] = False
     return _ok({})
 

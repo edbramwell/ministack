@@ -416,11 +416,11 @@ def test_get_trail_status_returns_the_deprecated_string_members(ct):
     status = ct.get_trail_status(Name=name)
     assert {key: status[key] for key in EMPTY_DEPRECATED_STATUS} == {
         **EMPTY_DEPRECATED_STATUS,
-        "TimeLoggingStarted": status["StartLoggingTime"].strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "TimeLoggingStopped": status["StopLoggingTime"].strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "TimeLoggingStarted": status["StartLoggingTime"].astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "TimeLoggingStopped": status["StopLoggingTime"].astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     raw = _raw_body(ct, "get_trail_status", Name=name)
-    assert all(isinstance(raw[key], float) for key in ("StartLoggingTime", "StopLoggingTime"))
+    assert all(isinstance(raw[key], int) for key in ("StartLoggingTime", "StopLoggingTime"))
 
 
 def test_get_trail_status_not_found(ct):
