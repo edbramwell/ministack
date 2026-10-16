@@ -7,6 +7,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **WAF v2 — regex pattern sets** — `CreateRegexPatternSet`, `GetRegexPatternSet`, `UpdateRegexPatternSet`, `DeleteRegexPatternSet` and `ListRegexPatternSets` now manage regional and CloudFront-scoped regex pattern sets, with their ARN (`regexpatternset`), tags and `LockToken` checks on update and delete (`WAFOptimisticLockException` for a stale token), as AWS does. Web ACL and rule group rules are stored as sent, so a `RegexPatternSetReferenceStatement` pointing at a pattern set ARN round-trips; the statement is not evaluated, as MiniStack does not inspect requests.
 ### Fixed
 - **IoT — device certificates take the mode of their CA** — a device certificate registered under a CA in `SNI_ONLY` mode, with or without `caCertificatePem`, or created by just-in-time registration reported `certificateMode` `DEFAULT`; it now takes its CA's mode, and RegisterCertificateWithoutCA stays `SNI_ONLY`. Contributed by @iot-rocket.
 - **IoT — deletes of unknown resources and `DeleteThing` `expectedVersion`** — `DeleteThing`, `DeleteThingType`, `DeleteThingGroup`, `RemoveThingFromThingGroup` with an unknown group and `DetachPolicy` with an unknown policy answered `ResourceNotFoundException`, and `DeleteThing` ignored `expectedVersion`; they now answer 200 as AWS does, and `DeleteThing` refuses a wrong `expectedVersion` with `VersionConflictException` before the attached-principal check. Contributed by @iot-rocket.
