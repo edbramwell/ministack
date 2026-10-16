@@ -347,6 +347,8 @@ def test_waf_regex_pattern_set_crud(wafv2):
     assert summary["Name"] == "test-regex"
     assert summary["Description"] == "first"
     assert ":regional/regexpatternset/test-regex/" in summary["ARN"]
+    with pytest.raises(wafv2.exceptions.WAFDuplicateItemException):
+        wafv2.create_regex_pattern_set(Name="test-regex", Scope="REGIONAL", RegularExpressionList=[])
 
     get_resp = wafv2.get_regex_pattern_set(Name="test-regex", Scope="REGIONAL", Id=uid)
     assert get_resp["RegexPatternSet"]["RegularExpressionList"] == [{"RegexString": "^/admin"}]
