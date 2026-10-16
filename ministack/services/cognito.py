@@ -1296,6 +1296,8 @@ def _access_token_error(data: dict):
         message = "Access Token has expired"
     elif claims.get("origin_jti") in _revoked_tokens:
         message = "Access Token has been revoked"
+    elif _API_TOKEN_SCOPE not in str(claims.get("scope", _API_TOKEN_SCOPE)).split():
+        message = "Access Token does not have required scopes"
     else:
         return None
     return error_response_json("NotAuthorizedException", message, 400)
@@ -6256,6 +6258,14 @@ def handle_oauth2_authorize(method, path, headers, query_params):
     if callback_urls and redirect_uri not in callback_urls:
         return _oauth2_error("invalid_request", f"redirect_uri is not allowed: {redirect_uri}")
 
+    allowed_scopes = client.get("AllowedOAuthScopes") or []
+    if scope and allowed_scopes and any(s not in allowed_scopes for s in scope.split()):
+        sep = "&" if "?" in redirect_uri else "?"
+        location = f"{redirect_uri}{sep}error=invalid_request&error_description=invalid_scope"
+        if state:
+            location += f"&state={quote(state)}"
+        return 302, {"Location": location, "Cache-Control": "no-store"}, b""
+
     if _use_choice_based_ui(client):
         html_body = _username_page_html(
             client_id, redirect_uri, scope, state, response_type,
@@ -7226,10 +7236,14 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             except (json.JSONDecodeError, TypeError):
                 pass
 
+        scope = _granted_scopes(client, form.get("scope"), "client_credentials")
+        if scope == "" and form.get("scope"):
+            # Nothing requested was granted: a resource-server scope the client lacks, or a non-custom scope.
+            error = "invalid_grant" if any("/" in s for s in form.get("scope", "").split()) else "invalid_scope"
+            return 400, {"Content-Type": "application/json"}, json.dumps({"error": error}).encode()
         access_token = _fake_token(cid, pool_id, cid, "access",
                                     trigger_source="TokenGeneration_ClientCredentials",
-                                    client_metadata=client_metadata,
-                                    scope=_granted_scopes(client, form.get("scope"), "client_credentials"))
+                                    client_metadata=client_metadata, scope=scope)
         resp = {
             "access_token": access_token,
             "token_type": "Bearer",

@@ -9679,7 +9679,7 @@ def test_iot_job_abort_events():
                           timeoutConfig={"inProgressTimeoutInMinutes": 1})
         await call("POST", "/things/ev-t1/jobs/ev-timeout", {"status": "IN_PROGRESS"}, device=True)
         iot_module._job_executions[("ev-t1", "ev-timeout")]["startedAt"] -= 61_000
-        await call("GET", "/things/ev-t1/jobs/ev-timeout", device=True)
+        await call("GET", "/things/ev-t1/jobs", device=True)
 
     events = _registry_events(calls, enable=("JOB", "JOB_EXECUTION"))
     assert [t for t, _e in events] == [

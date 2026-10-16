@@ -1706,6 +1706,17 @@ def test_cognito_access_token_must_be_a_signed_access_token_under_auth(monkeypat
     assert call("GetUser", AccessToken=alice["AccessToken"])["Username"] == "alice"
 
 
+def test_cognito_access_token_without_the_admin_scope_is_refused_under_auth(monkeypatch):
+    mod, call = _idp_in_process(monkeypatch, auth=True)
+    pid, cid, sign_in = _password_client_with_users(call, "alice")
+    sub = _decode_jwt_claims(sign_in("alice")["AccessToken"])["sub"]
+    scoped = mod._fake_token(sub, pid, cid, "access", username="alice", scope="openid email")
+    assert call("GetUser", AccessToken=scoped) == (
+        "NotAuthorizedException", "Access Token does not have required scopes")
+    admin = mod._fake_token(sub, pid, cid, "access", username="alice", scope="openid aws.cognito.signin.user.admin")
+    assert call("GetUser", AccessToken=admin)["Username"] == "alice"
+
+
 def test_cognito_sign_out_and_revoke_token_revoke_access_tokens_under_auth(monkeypatch):
     _, call = _idp_in_process(monkeypatch, auth=True)
     pid, cid, sign_in = _password_client_with_users(call, "alice", "bob")
@@ -4671,6 +4682,21 @@ def test_oauth2_token_authorization_code_drops_scopes_the_client_does_not_allow(
     assert _decode_jwt_claims(tokens['access_token'])['scope'] == 'openid email'
 
 
+@pytest.mark.parametrize('scope', ['openid api/admin', 'openid bogus'])
+def test_oauth2_authorize_refuses_a_scope_the_client_does_not_allow(scope):
+    """AWS redirects to the callback with invalid_scope instead of showing the login page."""
+    cognito_idp = make_client('cognito-idp')
+    client = _scoped_code_client(cognito_idp, _SCOPED_CLIENT_SCOPES)
+    query = urllib.parse.urlencode({'response_type': 'code', 'client_id': client['ClientId'],
+                                    'redirect_uri': 'http://localhost:3000/callback', 'scope': scope})
+    status, headers, _ = _get(f'{ENDPOINT}/oauth2/authorize?{query}', follow_redirects=False)
+    assert status == 302
+    location = urllib.parse.urlparse(headers['location'])
+    assert location._replace(query='').geturl() == 'http://localhost:3000/callback'
+    assert urllib.parse.parse_qs(location.query) == {'error': ['invalid_request'],
+                                                      'error_description': ['invalid_scope']}
+
+
 def test_oauth2_refreshed_tokens_keep_the_granted_scopes():
     """Both refresh paths keep the code grant's scopes; API sign-ins keep the admin scope."""
     cognito_idp = make_client('cognito-idp')
@@ -4726,7 +4752,6 @@ def test_oauth2_token_client_credentials():
         'grant_type': 'client_credentials',
         'client_id': client_id,
         'client_secret': client_secret,
-        'scope': 'openid',
     })
 
     assert status == 200
@@ -4750,7 +4775,6 @@ def test_oauth2_token_client_credentials_expires_with_the_client():
         'grant_type': 'client_credentials',
         'client_id': client['ClientId'],
         'client_secret': client['ClientSecret'],
-        'scope': 'openid',
     })
 
     assert status == 200
@@ -4790,6 +4814,26 @@ def test_oauth2_token_client_credentials_carries_granted_scopes(requested, scope
     assert _decode_jwt_claims(json.loads(body)['access_token'])['scope'] == scope
 
 
+@pytest.mark.parametrize('requested,error', [('api/admin', 'invalid_grant'), ('openid', 'invalid_scope')])
+def test_oauth2_token_client_credentials_refuses_scopes_it_cannot_grant(requested, error):
+    """A resource-server scope the client lacks is invalid_grant; a non-custom scope is invalid_scope."""
+    cognito_idp = make_client('cognito-idp')
+    pool_id, _ = _setup_pool_with_user(cognito_idp)
+    cognito_idp.create_resource_server(
+        UserPoolId=pool_id, Identifier='api', Name='api',
+        Scopes=[{'ScopeName': n, 'ScopeDescription': n} for n in ('read', 'admin')],
+    )
+    client = cognito_idp.create_user_pool_client(
+        UserPoolId=pool_id, ClientName='m2m', GenerateSecret=True, AllowedOAuthFlows=['client_credentials'],
+        AllowedOAuthScopes=['api/read'], AllowedOAuthFlowsUserPoolClient=True,
+    )['UserPoolClient']
+    status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', {
+        'grant_type': 'client_credentials', 'client_id': client['ClientId'],
+        'client_secret': client['ClientSecret'], 'scope': requested,
+    })
+    assert (status, json.loads(body)) == (400, {'error': error})
+
+
 def test_oauth2_token_client_auth_basic():
     cognito_idp = make_client('cognito-idp')
     pool_id, client = _setup_pool_with_user(cognito_idp, generate_secret=True)
@@ -4802,7 +4846,6 @@ def test_oauth2_token_client_auth_basic():
         f'{ENDPOINT}/oauth2/token',
         {
             'grant_type': 'client_credentials',
-            'scope': 'openid',
         },
         headers={'Authorization': f'Basic {basic}'},
     )
