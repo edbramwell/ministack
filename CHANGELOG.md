@@ -7,6 +7,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **IoT / CloudFormation — stack tags and provisioning templates** — stack-level tags never reached IoT resources; they now reach thing types, thing groups, policies, topic rules, CA certificates and provisioning templates without the `aws:cloudformation:` tags (job templates get none, as on AWS), and an update that only changes tags no longer adds a policy version. An `AWS::IoT::ProvisioningTemplate` `Enabled` of `"false"` from a parameter or the template enabled the template; it now disables it. `CreateProvisioningTemplate` and the CloudFormation type accepted any certificate resource; they now refuse one without a `Status` of `Active` or `Inactive` (any case) or whose `CertificateId` is not a reference to `AWS::IoT::Certificate::Id`, a second certificate resource and a resource without `Properties`, with AWS's messages. Contributed by @iot-rocket.
 ### Added
 - **WAF v2 — regex pattern sets** — `CreateRegexPatternSet`, `GetRegexPatternSet`, `UpdateRegexPatternSet`, `DeleteRegexPatternSet` and `ListRegexPatternSets` now manage regional and CloudFront-scoped regex pattern sets, with their ARN (`regexpatternset`), tags and `LockToken` checks on update and delete (`WAFOptimisticLockException` for a stale token), as AWS does. Web ACL and rule group rules are stored as sent, so a `RegexPatternSetReferenceStatement` pointing at a pattern set ARN round-trips; the statement is not evaluated, as MiniStack does not inspect requests.
 ### Fixed
