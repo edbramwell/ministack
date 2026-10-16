@@ -5118,6 +5118,9 @@ def _update_user_pool_domain(data):
             "InvalidParameterException", "The domain is not configured for this user pool.", 400)
     is_custom = pool.get("CustomDomain") == domain
     custom_config = data.get("CustomDomainConfig")
+    if is_custom and custom_config is None:
+        return error_response_json(
+            "InvalidParameterException", "Cannot convert custom domain to prefix domain.", 400)
     if custom_config is not None:
         if not is_custom:
             return error_response_json(

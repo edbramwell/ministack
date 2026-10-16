@@ -29482,6 +29482,18 @@ def test_cognito_change_set_reports_mfa_configuration_in_place(cfn, stack):
     assert change["Replacement"] == "False"
 
 
+def test_appsync_change_set_reports_graphql_schema_api_id_in_place(cfn, appsync, stack):
+    """AWS::AppSync::GraphQLSchema ApiId is "Update requires: No interruption" in the CloudFormation reference."""
+    apis = [appsync.create_graphql_api(name=f"schema-{_uuid_mod.uuid4().hex[:8]}",
+                                       authenticationType="API_KEY")["graphqlApi"]["apiId"] for _ in range(2)]
+    definition = "type Query { a: String }"
+    old = _template("AWS::AppSync::GraphQLSchema", {"ApiId": apis[0], "Definition": definition})
+    new = _template("AWS::AppSync::GraphQLSchema", {"ApiId": apis[1], "Definition": definition})
+    change = _change(cfn, stack(old), new)
+    assert _requirements(change) == {"ApiId": "Never"}
+    assert change["Replacement"] == "False"
+
+
 @pytest.mark.parametrize("prop,value,recreation,replacement", [
     ("ManagedLoginVersion", 2, "Never", "False"),
     ("Domain", None, "Always", "True"),

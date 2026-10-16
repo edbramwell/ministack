@@ -14233,7 +14233,8 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::StepFunctions::StateMachine": ("StateMachineName", "StateMachineType"),
     "AWS::AppSync::DataSource": ("ApiId", "Name"),
     "AWS::AppSync::Resolver": ("ApiId", "TypeName", "FieldName"),
-    "AWS::AppSync::GraphQLSchema": ("ApiId",),
+    # Every GraphQLSchema property is "Update requires: No interruption".
+    "AWS::AppSync::GraphQLSchema": (),
     "AWS::Cognito::UserPoolGroup": ("GroupName", "UserPoolId"),
     "AWS::Cognito::UserPoolResourceServer": ("Identifier", "UserPoolId"),
     "AWS::Cognito::UserPoolDomain": ("Domain", "UserPoolId"),

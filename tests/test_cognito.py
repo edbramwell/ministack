@@ -8804,6 +8804,21 @@ def test_cognito_update_custom_domain_certificate(cognito_idp):
     assert cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"].get("CustomDomain") == domain
 
 
+def test_cognito_update_custom_domain_without_certificate_is_refused(cognito_idp):
+    """A custom domain update must carry CustomDomainConfig; without it AWS refuses the conversion."""
+    pid = cognito_idp.create_user_pool(PoolName="CustomDomainNoCertPool")["UserPool"]["Id"]
+    domain = _pool_unique_domain(pid, "nocert")
+    cognito_idp.create_user_pool_domain(
+        UserPoolId=pid, Domain=domain, CustomDomainConfig={"CertificateArn": _CUSTOM_CERT_ARN})
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.update_user_pool_domain(UserPoolId=pid, Domain=domain, ManagedLoginVersion=2)
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc.value.response["Error"]["Message"] == "Cannot convert custom domain to prefix domain."
+    dd = cognito_idp.describe_user_pool_domain(Domain=domain)["DomainDescription"]
+    assert dd["ManagedLoginVersion"] == 1
+    assert dd["CustomDomainConfig"] == {"CertificateArn": _CUSTOM_CERT_ARN}
+
+
 def test_cognito_prefix_domain_unchanged_by_custom_domain_support(cognito_idp):
     """Regression: no CustomDomainConfig still means a prefix domain that expands."""
     pid = cognito_idp.create_user_pool(PoolName="PrefixDomainPool")["UserPool"]["Id"]
