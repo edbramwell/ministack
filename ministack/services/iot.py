@@ -24,9 +24,9 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
     ``CreateProvisioningClaim``, and fleet provisioning over MQTT
     (``$aws/certificates/create/json`` and
     ``$aws/provisioning-templates/{name}/provision/json``, after the
-    template's pre-provisioning hook allows it);
-    ``provisioningRoleArn`` is presence-checked but not resolved
-    (MiniStack does not validate IAM role ARNs elsewhere either)
+    template's pre-provisioning hook allows it); with ``AUTH=true``
+    RegisterThing needs a ``provisioningRoleArn`` that IoT may assume and
+    that allows its writes
   - Policies: ``CreatePolicy``, ``CreatePolicyVersion``, ``AttachPolicy``,
     ``DetachPolicy``, etc., plus the deprecated principal-policy family
     (``AttachPrincipalPolicy`` / ``DetachPrincipalPolicy`` /
@@ -1879,8 +1879,8 @@ async def _remove_thing_from_group(payload: dict) -> tuple:
 # Provisioning templates
 #
 # CRUD, CreateProvisioningClaim and the fleet provisioning MQTT API (JSON
-# topics) that applies a template to a certificate created over MQTT. The
-# pre-provisioning hook is stored but not invoked; with AUTH=true RegisterThing
+# topics) that applies a template to a certificate created over MQTT, once the
+# template's pre-provisioning hook allows it; with AUTH=true RegisterThing
 # answers AccessDenied unless provisioningRoleArn names a role IoT may assume
 # that allows every write it makes. Template versions are not
 # modeled: a template always carries defaultVersionId 1. Wire shapes and
@@ -2425,7 +2425,7 @@ def _provisioning_plan(template: dict, parameters: dict, cert_id: str) -> dict:
         )
 
     def reference(name):
-        if name not in values:
+        if values.get(name) is None:
             raise _ProvisioningRejected("InvalidParameters", f"Cannot resolve reference value: {name}")
         return values[name]
 
@@ -2486,24 +2486,6 @@ def _provisioning_plan(template: dict, parameters: dict, cert_id: str) -> dict:
                     return substitute(argument[0], argument[1])
                 raise invalid(function)
             raise invalid(function)
-                if values.get(argument) is None:
-                    raise _ProvisioningRejected(
-                        "InvalidParameters", f"Cannot resolve reference value: {argument}"
-                    )
-                return values[argument]
-            if (
-                function == "Fn::Join"
-                and isinstance(argument, list)
-                and len(argument) == 2
-                and isinstance(argument[1], list)
-            ):
-                return str(argument[0]).join(str(resolve(v)) for v in argument[1])
-            if function.startswith("Fn::"):
-                raise _ProvisioningRejected(
-                    "InvalidTemplate",
-                    f"Template {template['templateName']} uses {function}, "
-                    "which MiniStack does not resolve.",
-                )
         return {k: resolve(v) for k, v in value.items()}
 
     plan = {"thing": None, "status": "ACTIVE", "policies": []}
