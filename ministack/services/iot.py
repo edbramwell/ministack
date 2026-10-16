@@ -2526,7 +2526,7 @@ def _provisioning_hook_overrides(result: dict) -> dict:
 
 def _provisioning_plan(template: dict, parameters: dict, cert_id: str) -> dict:
     """The template's resources with ``Ref`` and the intrinsic functions resolved against the parameters."""
-    body = template["templateBody"]
+    body = _provisioning_template_body(template)
     body = json.loads(body) if isinstance(body, str) else body
     declared = body.get("Parameters")
     values = {

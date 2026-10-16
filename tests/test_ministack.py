@@ -3,10 +3,13 @@
 import asyncio
 import json
 import os
+import urllib.error
+import urllib.request
 import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
 
 import pytest
+from botocore.exceptions import ClientError
 
 from ministack import app as app_module
 
@@ -1273,3 +1276,207 @@ def test_failed_docker_hub_pull_falls_back_to_a_mirror_and_keeps_the_name(monkey
     with pytest.raises(APIError, match="registry unavailable"):
         ImageCollection.pull(None, "public.ecr.aws/lambda/python:3.12")
     assert pulled == ["public.ecr.aws/lambda/python:3.12"]
+
+
+# Wire envelopes and success Content-Types, from real-AWS captures: query errors carry
+# <Type> and no <?xml?>; ec2 keeps its declaration and charset; rest-xml carries <Type>.
+
+
+def _wire_ct(resp):
+    return resp["ResponseMetadata"]["HTTPHeaders"]["content-type"]
+
+
+def _wire_status(err):
+    return err["ResponseMetadata"]["HTTPStatusCode"]
+
+
+def test_iam_query_error_envelope(iam):
+    with pytest.raises(ClientError) as exc:
+        iam.get_user(UserName="wire-missing-user")
+    err = exc.value.response
+    assert err["Error"]["Code"] == "NoSuchEntity"
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_status(err) == 404
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_sns_query_error_envelope(sns):
+    with pytest.raises(ClientError) as exc:
+        sns.set_topic_attributes(
+            TopicArn="arn:aws:sns:us-east-1:000000000000:wire-missing",
+            AttributeName="DisplayName",
+            AttributeValue="x",
+        )
+    err = exc.value.response
+    assert err["Error"]["Code"] == "NotFound"
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_elbv2_query_error_envelope(elbv2):
+    with pytest.raises(ClientError) as exc:
+        elbv2.describe_load_balancers(Names=["wire-missing"])
+    err = exc.value.response
+    assert err["Error"]["Code"] == "LoadBalancerNotFound"
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_autoscaling_query_error_envelope(autoscaling):
+    with pytest.raises(ClientError) as exc:
+        autoscaling.update_auto_scaling_group(
+            AutoScalingGroupName="wire-missing")
+    err = exc.value.response
+    assert err["Error"]["Code"] == "ValidationError"
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_elasticache_query_error_envelope(ec):
+    with pytest.raises(ClientError) as exc:
+        ec.describe_cache_clusters(CacheClusterId="wire-missing")
+    err = exc.value.response
+    assert err["Error"]["Code"] == "CacheClusterNotFound"
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_rds_query_error_envelope(rds):
+    with pytest.raises(ClientError) as exc:
+        rds.describe_db_instances(DBInstanceIdentifier="wire-missing")
+    err = exc.value.response
+    assert err["Error"]["Code"] == "DBInstanceNotFound"
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_status(err) == 404
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_docdb_query_error_envelope(docdb):
+    with pytest.raises(ClientError) as exc:
+        docdb.describe_db_instances(DBInstanceIdentifier="wire-missing")
+    err = exc.value.response
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_cloudwatch_query_error_envelope():
+    # boto3 1.42+ speaks smithy-rpc-v2-cbor to CloudWatch: the Query path needs a raw request.
+    req = urllib.request.Request(
+        f"{ENDPOINT}/",
+        data=b"Action=GetDashboard&Version=2010-08-01&DashboardName=wire-missing",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/"
+                             "us-east-1/monitoring/aws4_request, "
+                             "SignedHeaders=host, Signature=x",
+        },
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req)
+    http_err = exc.value
+    body = http_err.read().decode()
+    assert http_err.headers["content-type"] == "text/xml"
+    assert not body.startswith("<?xml")
+    assert "<Type>Sender</Type>" in body
+    assert "ResourceNotFound" in body
+
+
+def test_ses_query_error_envelope(ses):
+    with pytest.raises(ClientError) as exc:
+        ses.describe_receipt_rule_set(RuleSetName="wire-missing")
+    err = exc.value.response
+    assert err["Error"]["Code"] == "RuleSetDoesNotExist"
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_cfn_query_error_envelope(cfn):
+    with pytest.raises(ClientError) as exc:
+        cfn.describe_stacks(StackName="wire-missing")
+    err = exc.value.response
+    assert err["Error"]["Code"] == "ValidationError"
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_ec2_error_envelope_has_no_type_and_charset(ec2):
+    with pytest.raises(ClientError) as exc:
+        ec2.describe_instances(InstanceIds=["i-0123456789abcdef0"])
+    err = exc.value.response
+    assert err["Error"]["Code"] == "InvalidInstanceID.NotFound"
+    assert err["Error"].get("Type") is None
+    assert _wire_ct(err) == "text/xml;charset=UTF-8"
+
+
+def test_route53_restxml_error_envelope(r53):
+    with pytest.raises(ClientError) as exc:
+        r53.get_hosted_zone(Id="/hostedzone/ZWIREMISSING000")
+    err = exc.value.response
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_query_success_content_types(iam, sns, sts, ec, autoscaling,
+                                     elbv2, ses, rds, docdb, cfn):
+    calls = [
+        (iam.list_users, {}),
+        (sns.list_topics, {}),
+        (sts.get_caller_identity, {}),
+        (ec.describe_cache_clusters, {}),
+        (autoscaling.describe_auto_scaling_groups, {}),
+        (elbv2.describe_load_balancers, {}),
+        (ses.list_identities, {}),
+        (rds.describe_db_instances, {}),
+        (docdb.describe_db_instances, {}),
+        (cfn.list_stacks, {}),
+    ]
+    for call, kwargs in calls:
+        assert _wire_ct(call(**kwargs)) == "text/xml", call.__name__
+
+
+def test_cloudwatch_query_success_content_type():
+    req = urllib.request.Request(
+        f"{ENDPOINT}/",
+        data=b"Action=ListMetrics&Version=2010-08-01",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/"
+                             "us-east-1/monitoring/aws4_request, "
+                             "SignedHeaders=host, Signature=x",
+        },
+    )
+    with urllib.request.urlopen(req) as resp:
+        assert resp.headers["content-type"] == "text/xml"
+
+
+def test_json_success_content_types(ddb, sqs, kin):
+    assert _wire_ct(ddb.list_tables()) == "application/x-amz-json-1.0"
+    assert _wire_ct(sqs.list_queues()) == "application/x-amz-json-1.0"
+    assert _wire_ct(kin.list_streams()) == "application/x-amz-json-1.1"
+
+
+def test_restxml_success_content_types(s3, r53):
+    assert _wire_ct(s3.list_buckets()) == "application/xml"
+    assert _wire_ct(r53.list_hosted_zones()) == "text/xml"
+
+
+def test_restjson_success_content_type(lam):
+    assert _wire_ct(lam.list_functions()) == "application/json"
+
+
+def test_ec2_success_content_type(ec2):
+    assert _wire_ct(ec2.describe_regions()) == "text/xml;charset=UTF-8"
+
+
+def test_s3_object_payload_content_type_not_rewritten(s3):
+    # A stored object's Content-Type is payload, not an envelope.
+    bucket = "wire-ct-payload"
+    s3.create_bucket(Bucket=bucket)
+    try:
+        s3.put_object(Bucket=bucket, Key="doc.xml", Body=b"<a/>",
+                      ContentType="text/xml")
+        resp = s3.get_object(Bucket=bucket, Key="doc.xml")
+        assert _wire_ct(resp) == "text/xml"
+    finally:
+        s3.delete_object(Bucket=bucket, Key="doc.xml")
+        s3.delete_bucket(Bucket=bucket)

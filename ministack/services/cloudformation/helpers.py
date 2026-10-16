@@ -46,8 +46,7 @@ def _xml(status, root_tag, inner):
 
 
 def _error(code, message, status=400):
-    # Query-protocol error envelope per real-AWS captures (17-region
-    # sweep): <Type> inside <Error> and no <?xml?> declaration.
+    # Query error envelope: <Type> in <Error>, no <?xml?> (AWS captures).
     t = "Sender" if status < 500 else "Receiver"
     body = (
         f'<ErrorResponse xmlns="{CFN_NS}">'
