@@ -5095,6 +5095,92 @@ class TestHeaderSignatures:
         _local_client("dynamodb", user_key[0], "wrong-secret").list_tables()
 
 
+def _presigned(key, secret, service, query, token=None, edit=None):
+    """A GET presigned in its query string, as botocore's SigV4QueryAuth signs it: (code or None, status, body)."""
+    from botocore.auth import SigV4QueryAuth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    request = AWSRequest(method="GET", url=f"http://localhost:4566/?{query}")
+    SigV4QueryAuth(Credentials(key, secret, token), service, "us-east-1", 300).add_auth(request)
+    url = edit(request.url) if edit else request.url
+    response = _asgi_send(AWSRequest(method="GET", url=url).prepare())
+    body = response.content.decode()
+    code = re.search(r"<Code>([^<]*)</Code>", body) or re.search(r'"__type": "([^"]*)"', body)
+    return (code.group(1) if code else None), response.status_code, body
+
+
+_LIST_USERS = "Action=ListUsers&Version=2010-05-08"
+_LIST_QUEUES = "Action=ListQueues&Version=2012-11-05"
+
+
+def _drop(name):
+    return lambda url: re.sub(rf"&?{name}=[^&]*", "", url)
+
+
+class TestQuerySignatures:
+    def test_right_secret_passes(self, user_key):
+        assert _presigned(*user_key, "iam", _LIST_USERS)[:2] == (None, 200)
+
+    @pytest.mark.parametrize("service,query", [("iam", _LIST_USERS), ("sqs", _LIST_QUEUES)])
+    def test_wrong_or_forged_signature_is_refused(self, user_key, service, query):
+        assert _presigned(user_key[0], "wrong-secret", service, query)[:2] == ("SignatureDoesNotMatch", 403)
+        forged = _presigned(*user_key, service, query,
+                            edit=lambda url: re.sub(r"X-Amz-Signature=\w+", "X-Amz-Signature=" + "0" * 64, url))
+        assert forged[:2] == ("SignatureDoesNotMatch", 403)
+
+    def test_query_mode_sqs_failure_is_sqs_query_xml(self, user_key):
+        code, status, body = _presigned(user_key[0], "wrong-secret", "sqs", _LIST_QUEUES)
+        assert (code, status) == ("SignatureDoesNotMatch", 403)
+        assert body.startswith('<?xml version="1.0"?><ErrorResponse xmlns="http://queue.amazonaws.com/doc/2012-11-05/">'
+                               "<Error><Type>Sender</Type><Code>SignatureDoesNotMatch</Code>")
+        assert "</Message><Detail/></Error><RequestId>" in body
+        assert _failure(lambda: _local_client("sqs", user_key[0], "wrong-secret").list_queues()) == (
+            "SignatureDoesNotMatch", 403)
+
+    def test_session_key_needs_its_token_and_signature(self, user_key):
+        session = _local_client("sts", *user_key).get_session_token()["Credentials"]
+        key, secret, token = session["AccessKeyId"], session["SecretAccessKey"], session["SessionToken"]
+        assert _presigned(key, secret, "sqs", _LIST_QUEUES, token)[:2] == (None, 200)
+        assert _presigned(key, secret, "sqs", _LIST_QUEUES)[:2] == ("InvalidClientTokenId", 403)
+        forged = _presigned(key, secret, "sqs", _LIST_QUEUES, token,
+                            edit=lambda url: re.sub(r"X-Amz-Signature=\w+", "X-Amz-Signature=" + "0" * 64, url))
+        assert forged[:2] == ("SignatureDoesNotMatch", 403)
+
+    def test_signature_outside_the_time_window_is_refused(self, user_key):
+        def to_2020(url):
+            url = re.sub(r"X-Amz-Date=\d{8}T\d{6}Z", "X-Amz-Date=20200101T000000Z", url)
+            return re.sub(r"%2F\d{8}%2F", "%2F20200101%2F", url)
+
+        code, status, body = _presigned(*user_key, "iam", _LIST_USERS, edit=to_2020)
+        assert (code, status) == ("SignatureDoesNotMatch", 403)
+        assert "Signature expired: 20200101T000000Z is now earlier than " in body
+
+    @pytest.mark.parametrize("name", ["X-Amz-Date", "X-Amz-SignedHeaders", "X-Amz-Signature"])
+    def test_missing_query_parameter_is_refused(self, user_key, name):
+        code, status, body = _presigned(*user_key, "sqs", _LIST_QUEUES, edit=_drop(name))
+        assert (code, status) == ("IncompleteSignature", 400)
+        assert (f"AWS query-string parameters must include &apos;{name}&apos;. "
+                "Re-examine the query-string parameters.") in body or (
+            f"AWS query-string parameters must include '{name}'. Re-examine the query-string parameters.") in body
+
+    def test_credential_must_have_five_elements(self, user_key):
+        code, status, body = _presigned(
+            *user_key, "sqs", _LIST_QUEUES,
+            edit=lambda url: re.sub(r"X-Amz-Credential=([^%]+)%2F[^&]*", r"X-Amz-Credential=\1%2Fus-east-1", url))
+        assert (code, status) == ("IncompleteSignature", 400)
+        assert "Credential must have exactly 5 slash-delimited elements" in body
+
+    def test_root_key_signs_with_any_secret(self, user_key):
+        assert _presigned("test", "anything", "iam", _LIST_USERS)[:2] == (None, 200)
+
+    def test_signature_is_not_checked_without_auth(self, user_key, monkeypatch):
+        from ministack import app as app_mod
+
+        monkeypatch.setattr(app_mod, "AUTH", False)
+        assert _presigned(user_key[0], "wrong-secret", "iam", _LIST_USERS)[:2] == (None, 200)
+
+
 class TestSessionTokens:
     @pytest.fixture
     def session(self, user_key):

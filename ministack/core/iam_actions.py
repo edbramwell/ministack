@@ -2095,6 +2095,15 @@ def access_denied_response(service: str, action: str, principal_arn: str,
         )
         return status, {"Content-Type": "text/xml"}, body.encode()
 
+    if service == "sqs" and headers is not None and not headers.get("x-amz-target"):
+        # A query-mode SQS request is answered in SQS's query XML (live AWS capture).
+        body = (
+            '<?xml version="1.0"?><ErrorResponse xmlns="http://queue.amazonaws.com/doc/2012-11-05/">'
+            f"<Error><Type>Sender</Type><Code>{_esc_code}</Code><Message>{_esc_msg}</Message><Detail/></Error>"
+            f"<RequestId>{_esc_rid}</RequestId></ErrorResponse>"
+        )
+        return status, {"Content-Type": "text/xml"}, body.encode()
+
     # JSON protocol (DynamoDB, Lambda, KMS, Logs, Glue, etc.)
     json_type = code if code != "AccessDenied" else "AccessDeniedException"
     body = json.dumps({

@@ -549,6 +549,33 @@ def test_iot_jobs_presigned_url_host(host, expected):
     assert urlsplit(url).netloc == (expected or f"{iot._MINISTACK_HOST}:{iot._GATEWAY_PORT}")
 
 
+@pytest.mark.parametrize("trust,signed", [
+    (None, False),
+    ({"Service": "lambda.amazonaws.com"}, False),
+    ({"Service": "iot.amazonaws.com"}, True),
+])
+def test_iot_jobs_presigned_url_needs_a_role_iot_may_assume_under_auth(monkeypatch, trust, signed):
+    """With AUTH=true no session is minted for a role that is missing or does not trust IoT: the placeholder stays."""
+    import ministack.app as app_mod
+    from ministack.services import iam as iam_svc
+    from ministack.services import iot
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    name = _unique("presign")
+    if trust is not None:
+        iam_svc._roles[name] = {"RoleName": name, "AssumeRolePolicyDocument": json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Principal": trust, "Action": "sts:AssumeRole"}]})}
+    job = {"document": json.dumps({"fw": _presign("s3://bucket/fw.bin")}),
+           "presignedUrlConfig": {"roleArn": f"arn:aws:iam::000000000000:role/{name}"}}
+    try:
+        url = json.loads(iot._jobs_presigned_document(job))["fw"]
+    finally:
+        iam_svc._roles.pop(name, None)
+    assert ("X-Amz-Credential=" in url) is signed
+    assert url.startswith("http") is signed
+
+
 def test_iot_jobs_presigned_url_placeholders_refusals(iot_client, s3):
     """A placeholder without presignedUrlConfig.roleArn, or naming no S3 object, refuses the job."""
     thing, bucket = _unique("jobs-thing"), _unique("jobs-presign")
