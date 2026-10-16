@@ -702,6 +702,12 @@ def test_iot_delete_thing_type_refused_while_a_thing_uses_it(iot_client):
     iot_client.delete_thing(thingName=thing)
 
 
+
+def test_iot_delete_thing_type_of_an_unknown_name_succeeds(iot_client):
+    """DeleteThingType answers 200 for a name that does not exist."""
+    resp = iot_client.delete_thing_type(thingTypeName=_unique("type"))
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+
 # ---------------------------------------------------------------------------
 # ThingGroup CRUD + membership
 # ---------------------------------------------------------------------------
@@ -826,6 +832,12 @@ def test_iot_delete_thing_group_with_child_groups_is_refused(iot_client):
     iot_client.delete_thing_group(thingGroupName=parent)
 
 
+def test_iot_delete_thing_group_of_an_unknown_name_succeeds(iot_client):
+    """DeleteThingGroup answers 200 for a name that does not exist."""
+    resp = iot_client.delete_thing_group(thingGroupName=_unique("group"))
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+
+
 def test_iot_thing_group_membership(iot_client):
     gname = _unique("group")
     tname = _unique("thing")
@@ -842,6 +854,24 @@ def test_iot_thing_group_membership(iot_client):
 
     iot_client.delete_thing(thingName=tname)
     iot_client.delete_thing_group(thingGroupName=gname)
+
+
+def test_iot_remove_thing_from_an_unknown_thing_group_succeeds(iot_client):
+    """An unknown group name answers 200; an unknown thing, or no group name at all, is refused."""
+    tname, gname = _unique("thing"), _unique("group")
+    iot_client.create_thing(thingName=tname)
+    resp = iot_client.remove_thing_from_thing_group(thingGroupName=_unique("group"), thingName=tname)
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+    with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+        iot_client.remove_thing_from_thing_group(thingGroupName=_unique("group"), thingName=_unique("thing"))
+    group_arn = iot_client.create_thing_group(thingGroupName=gname)["thingGroupArn"]
+    iot_client.add_thing_to_thing_group(thingGroupName=gname, thingName=tname)
+    with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+        iot_client.remove_thing_from_thing_group(thingGroupArn=group_arn, thingName=tname)
+    assert tname in iot_client.list_things_in_thing_group(thingGroupName=gname)["things"]
+    iot_client.remove_thing_from_thing_group(thingGroupName=gname, thingName=tname)
+    iot_client.delete_thing_group(thingGroupName=gname)
+    iot_client.delete_thing(thingName=tname)
 
 
 def test_iot_list_thing_groups_for_thing(iot_client):
@@ -1390,6 +1420,39 @@ def test_iot_delete_thing_refused_while_a_principal_is_attached(iot_client):
     iot_client.delete_certificate(certificateId=cert_id)
 
 
+def test_iot_delete_thing_of_an_unknown_name_succeeds(iot_client):
+    """DeleteThing answers 200 for a name that does not exist, also with expectedVersion."""
+    name = _unique("thing")
+    for params in ({}, {"expectedVersion": 1}, {"expectedVersion": 7}):
+        resp = iot_client.delete_thing(thingName=name, **params)
+        assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+    with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+        iot_client.describe_thing(thingName=name)
+
+
+def test_iot_delete_thing_checks_expected_version(iot_client):
+    """A wrong expectedVersion is refused before the attached-principal check; the current one deletes."""
+    pytest.importorskip("cryptography")
+    name = _unique("thing")
+    iot_client.create_thing(thingName=name)
+    cert = iot_client.create_keys_and_certificate(setAsActive=False)
+    iot_client.attach_thing_principal(thingName=name, principal=cert["certificateArn"])
+    with pytest.raises(ClientError) as ei:
+        iot_client.delete_thing(thingName=name, expectedVersion=2)
+    err = ei.value.response
+    assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+        409, "VersionConflictException", f"The version for thing {name} does not match the expected version.")
+    with pytest.raises(ClientError) as ei:
+        iot_client.delete_thing(thingName=name, expectedVersion=1)
+    assert ei.value.response["Error"]["Code"] == "InvalidRequestException"
+
+    iot_client.detach_thing_principal(thingName=name, principal=cert["certificateArn"])
+    iot_client.delete_thing(thingName=name, expectedVersion=1)
+    with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+        iot_client.describe_thing(thingName=name)
+    iot_client.delete_certificate(certificateId=cert["certificateId"])
+
+
 def test_iot_thing_arn_tail_parser_requires_iot_thing_scope():
     from ministack.core.responses import (
         get_account_id,
@@ -1812,6 +1875,22 @@ def test_iot_legacy_principal_policy_unknown_policy_404(iot_client):
             policyName=_unique("nope"), principal="arn:aws:iot:cert/none"
         )
     assert ei.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_iot_detach_policy_of_an_unknown_policy_succeeds(iot_client):
+    """DetachPolicy succeeds for an unknown policy; AttachPolicy and DetachPrincipalPolicy refuse it."""
+    pytest.importorskip("cryptography")
+    name = _unique("policy")
+    cert = iot_client.create_keys_and_certificate(setAsActive=False)
+    arn = cert["certificateArn"]
+    for target in (arn, arn.rsplit("/", 1)[0] + "/" + "ab" * 32):
+        resp = iot_client.detach_policy(policyName=name, target=target)
+        assert resp["ResponseMetadata"]["HTTPStatusCode"] == 200
+    with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+        iot_client.detach_principal_policy(policyName=name, principal=arn)
+    with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+        iot_client.attach_policy(policyName=name, target=arn)
+    iot_client.delete_certificate(certificateId=cert["certificateId"])
     
     
 # ---------------------------------------------------------------------------
@@ -9825,6 +9904,41 @@ def test_iot_register_certificate_without_ca_pem_links_the_signing_ca(iot_client
             assert desc["caCertificateId"] == ca_id
             listing = iot_client.list_certificates_by_ca(caCertificateId=ca_id)
             assert [c["certificateId"] for c in listing["certificates"]] == [cert_id]
+    finally:
+        _delete_certificates_and_cas(iot_client, cert_ids, ca_ids)
+
+
+def test_iot_register_certificate_takes_the_mode_of_its_ca(iot_client):
+    """A certificate registered under a CA reports the CA's mode; RegisterCertificateWithoutCA stays SNI_ONLY."""
+    modes, ca_ids, cert_ids = {}, [], []
+    try:
+        for ca_mode in ("SNI_ONLY", "DEFAULT"):
+            ca_pem, verification_pem, leaves = _generate_ca_and_leaves(
+                _registration_code(iot_client), count=3)
+            ca_ids.append(iot_client.register_ca_certificate(
+                caCertificate=ca_pem, setAsActive=True, certificateMode=ca_mode,
+                **({"verificationCertificate": verification_pem} if ca_mode == "DEFAULT" else {}),
+            )["certificateId"])
+            with_ca_pem, no_ca_pem, without_ca = leaves
+            registered = {
+                "with-ca-pem": iot_client.register_certificate(
+                    certificatePem=with_ca_pem, caCertificatePem=ca_pem, status="ACTIVE"),
+                "no-ca-pem": iot_client.register_certificate(certificatePem=no_ca_pem, status="ACTIVE"),
+                "without-ca": iot_client.register_certificate_without_ca(
+                    certificatePem=without_ca, status="ACTIVE"),
+            }
+            for case, resp in registered.items():
+                cert_ids.append(resp["certificateId"])
+                modes[ca_mode, case] = iot_client.describe_certificate(
+                    certificateId=resp["certificateId"])["certificateDescription"]["certificateMode"]
+        assert modes == {
+            ("SNI_ONLY", "with-ca-pem"): "SNI_ONLY",
+            ("SNI_ONLY", "no-ca-pem"): "SNI_ONLY",
+            ("SNI_ONLY", "without-ca"): "SNI_ONLY",
+            ("DEFAULT", "with-ca-pem"): "DEFAULT",
+            ("DEFAULT", "no-ca-pem"): "DEFAULT",
+            ("DEFAULT", "without-ca"): "SNI_ONLY",
+        }
     finally:
         _delete_certificates_and_cas(iot_client, cert_ids, ca_ids)
 

@@ -1313,7 +1313,7 @@ def _handle_thing(method: str, path: str, body: bytes, qp: dict) -> tuple:
     if method == "PATCH":
         return _update_thing(name, _parse_body(body))
     if method == "DELETE":
-        return _delete_thing(name)
+        return _delete_thing(name, qp.get("expectedVersion"))
     return error_response_json(
         "InvalidRequestException", f"Unsupported method: {method}", 400
     )
@@ -1439,10 +1439,17 @@ def _update_thing(name: str, payload: dict) -> tuple:
     return json_response({})
 
 
-def _delete_thing(name: str) -> tuple:
+def _delete_thing(name: str, expected_version=None) -> tuple:
+    """DeleteThing; an unknown name answers 200 like a completed delete."""
     thing = _things.get(name)
     if thing is None:
-        return _error_not_found("Thing", name)
+        return json_response({})
+    if expected_version not in (None, "") and str(expected_version) != str(thing.get("version", 1)):
+        return error_response_json(
+            "VersionConflictException",
+            f"The version for thing {name} does not match the expected version.",
+            409,
+        )
     if any(p.rsplit("/", 1)[-1] in _certificates for p in thing.get("principals", [])):
         return error_response_json(
             "InvalidRequestException",
@@ -1602,7 +1609,7 @@ def _deprecate_thing_type(name: str, payload: dict) -> tuple:
 def _delete_thing_type(name: str) -> tuple:
     t = _thing_types.get(name)
     if t is None:
-        return _error_not_found("ThingType", name)
+        return json_response({})
     if not t["thingTypeMetadata"].get("deprecated"):
         return error_response_json(
             "InvalidRequestException",
@@ -1815,7 +1822,7 @@ def _update_thing_group(name: str, payload: dict) -> tuple:
 def _delete_thing_group(name: str) -> tuple:
     g = _thing_groups.get(name)
     if g is None:
-        return _error_not_found("ThingGroup", name)
+        return json_response({})
     if any((c.get("thingGroupMetadata") or {}).get("parentGroupName") == name for c in _thing_groups.values()):
         return error_response_json(
             "InvalidRequestException",
@@ -1873,10 +1880,11 @@ async def _remove_thing_from_group(payload: dict) -> tuple:
     tname = payload.get("thingName")
     group = _thing_groups.get(gname) if gname else None
     thing = _things.get(tname) if tname else None
-    if group is None:
-        return _error_not_found("ThingGroup", gname or "")
     if thing is None:
         return _error_not_found("Thing", tname or "")
+    if group is None:
+        # Only a named group that does not exist answers 200; a group ARN is not resolved.
+        return json_response({}) if gname else _error_not_found("ThingGroup", "")
     prev_next = jobs_first_pending_job_id(tname)
     left = tname in group.get("things", [])
     if left:
@@ -2816,12 +2824,14 @@ def _provisioning_thing_changes(
 def _certificate_record(
     cert_id: str, cert_pem: str, status: str, ca_id: str | None = None
 ) -> dict:
-    """The registry record of a device certificate, owned by the current scope."""
+    """The registry record of a device certificate, owned by the current scope; it takes its CA's mode."""
+    ca = _ca_certificates.get(ca_id) if ca_id else None
     return {
         "certificateId": cert_id,
         "certificateArn": _cert_arn(cert_id),
         "certificatePem": cert_pem,  # verbatim
         "status": status,
+        "certificateMode": (ca or {}).get("certificateMode", "DEFAULT"),
         "creationDate": _now_epoch(),
         "ownedBy": get_account_id(),
         "caCertificateId": ca_id,
@@ -3844,6 +3854,9 @@ def _handle_target_policy(method: str, path: str, body: bytes, qp: dict) -> tupl
         return error_response_json(
             "InvalidRequestException", f"Unsupported method: {method}", 400
         )
+    # DetachPolicy of an unknown policy succeeds; DetachPrincipalPolicy refuses it.
+    if method != "PUT" and name not in _policies:
+        return json_response({})
     return _change_policy_target(
         name, _parse_body(body).get("target"), attach=method == "PUT"
     )
