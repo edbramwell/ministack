@@ -11846,6 +11846,7 @@ def _asg_update(physical_id, old_props, new_props, stack_name, logical_id=None):
 def _asg_delete(physical_id, props):
     _asg._asgs.pop(physical_id, None)
     _asg._tags.pop(physical_id, None)
+    _asg._delete_group_hooks(physical_id)
     _asg._delete_group_policies(physical_id)
 
 
@@ -11913,17 +11914,17 @@ def _asg_policy_delete(physical_id, props):
 def _asg_hook_create(logical_id, props, stack_name):
     asg_name = props.get("AutoScalingGroupName", "")
     hook_name = props.get("LifecycleHookName") or _physical_name(stack_name, logical_id, max_len=255)
-    key = f"{asg_name}/{hook_name}"
-    _asg._hooks[key] = {
-        "LifecycleHookName": hook_name,
-        "AutoScalingGroupName": asg_name,
-        "LifecycleTransition": props.get("LifecycleTransition", "autoscaling:EC2_INSTANCE_LAUNCHING"),
-        "HeartbeatTimeout": int(props.get("HeartbeatTimeout", 3600)),
-        "DefaultResult": props.get("DefaultResult", "ABANDON"),
-        "NotificationTargetARN": props.get("NotificationTargetARN", ""),
-        "RoleARN": props.get("RoleARN", ""),
-    }
+    _asg._hooks[f"{asg_name}/{hook_name}"] = _asg._hook_record(asg_name, hook_name, props)
     return hook_name, {"LifecycleHookName": hook_name}
+
+
+def _asg_hook_update(physical_id, old_props, new_props, stack_name):
+    """AutoScalingGroupName and LifecycleHookName replace; the rest is in place and a dropped member stays."""
+    asg_name = new_props.get("AutoScalingGroupName", "")
+    key = f"{asg_name}/{physical_id}"
+    current = _asg._hooks.get(key, {})
+    _asg._hooks[key] = _asg._hook_record(asg_name, physical_id, {**current, **new_props})
+    return physical_id, {"LifecycleHookName": physical_id}
 
 
 def _asg_hook_delete(physical_id, props):
@@ -13571,11 +13572,10 @@ def _iot_provisioning_template_update(physical_id, old_props, new_props, stack_n
     A TemplateName change is a replacement, handled the way AWS::IoT::Policy's
     rename is: the new template is created and the old one removed, since a
     template no stack still declares is not left behind. TemplateBody is not
-    an UpdateProvisioningTemplate member (AWS stores it as a new version via
-    CreateProvisioningTemplateVersion, which MiniStack does not model), so a
-    changed body is written onto the stored record directly — the template
-    always stays at defaultVersionId 1. TemplateType requires replacement,
-    which ``_update_resource`` performs before this runs.
+    an UpdateProvisioningTemplate member: a changed body becomes the new
+    default version, after the oldest is deleted at the version limit.
+    TemplateType requires replacement, which ``_update_resource`` performs
+    before this runs.
     """
     name = new_props.get("TemplateName") or _physical_name(
         stack_name, logical_id or physical_id, max_len=36
@@ -13600,14 +13600,21 @@ def _iot_provisioning_template_update(physical_id, old_props, new_props, stack_n
         raise ValueError(f"AWS::IoT::ProvisioningTemplate update failed: {resp[2]!r}")
     body = _iot_provisioning_template_body(new_props)
     tmpl = _iot._provisioning_templates.get(name)
-    if tmpl is not None and body and body != tmpl.get("templateBody"):
+    if tmpl is not None and body and body != _iot._provisioning_template_body(tmpl):
         err = _iot._validate_provisioning_template_body(body)
         if err is not None:
             raise ValueError(
                 f"AWS::IoT::ProvisioningTemplate update failed: {err[2]!r}"
             )
-        tmpl["templateBody"] = body
-        _iot._provisioning_templates[name] = tmpl
+        if len(tmpl["versions"]) >= _iot._PROVISIONING_TEMPLATE_VERSIONS_MAX:
+            oldest = min(v["versionId"] for v in tmpl["versions"].values()
+                         if v["versionId"] != tmpl["defaultVersionId"])
+            _iot._delete_provisioning_template_version(name, str(oldest))
+        resp = _iot._create_provisioning_template_version(
+            name, {"templateBody": body}, {"setAsDefault": "true"}
+        )
+        if resp[0] >= 400:
+            raise ValueError(f"AWS::IoT::ProvisioningTemplate update failed: {resp[2]!r}")
     _iot_update_tags(_iot._provisioning_template_arn(name), old_props, new_props)
     return name, _iot_provisioning_template_attrs(name)
 
@@ -14208,6 +14215,7 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
         "LaunchConfigurationName", "MetadataOptions", "PlacementTenancy", "RamDiskId",
         "SecurityGroups", "SpotPrice", "UserData",
     ),
+    "AWS::AutoScaling::LifecycleHook": ("AutoScalingGroupName", "LifecycleHookName"),
     "AWS::IAM::InstanceProfile": ("InstanceProfileName", "Path"),
     "AWS::IAM::Role": ("RoleName", "Path"),
     "AWS::IAM::User": ("UserName",),
@@ -15251,7 +15259,11 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _asg_policy_delete,
     },
-    "AWS::AutoScaling::LifecycleHook": {"create": _asg_hook_create, "delete": _asg_hook_delete},
+    "AWS::AutoScaling::LifecycleHook": {
+        "create": _asg_hook_create,
+        "update": _asg_hook_update,
+        "delete": _asg_hook_delete,
+    },
     "AWS::AutoScaling::ScheduledAction": {
         "create": _asg_scheduled_create,
         "update": _asg_scheduled_update,
