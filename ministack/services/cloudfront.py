@@ -746,12 +746,12 @@ def _function_arns_in(dist):
 def _function_dev_status(fn):
     """DEVELOPMENT-stage Status: UNPUBLISHED until PublishFunction has copied
     the current development version to LIVE (an UpdateFunction since then makes
-    it UNPUBLISHED again), then ASSOCIATED while a distribution's cache behavior
+    it UNPUBLISHED again), then DEPLOYED while a distribution's cache behavior
     references the function and UNASSOCIATED otherwise."""
     if not fn.get("live_etag") or fn.get("published_dev_etag") != fn["dev_etag"]:
         return "UNPUBLISHED"
     if any(fn["arn"] in _function_arns_in(d) for d in _distributions.values()):
-        return "ASSOCIATED"
+        return "DEPLOYED"
     return "UNASSOCIATED"
 
 
