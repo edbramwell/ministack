@@ -24,7 +24,7 @@ import sys
 import tempfile
 import time
 import uuid
-from urllib.parse import parse_qs, quote, unquote
+from urllib.parse import parse_qs, quote, unquote, urlencode
 
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _MINISTACK_PORT = os.environ.get("GATEWAY_PORT", "4566")
@@ -204,6 +204,7 @@ _NON_S3_VHOST_NAMES = frozenset(
         "transfer",
         "cur",
         "budgets",
+        "kinesisanalytics",
         "cloudfront-kvs",
         "appsync-api",
         "appsync-realtime-api",
@@ -458,6 +459,7 @@ SERVICE_REGISTRY = {
     "cloudtrail": {"module": "cloudtrail"},
     "cur": {"module": "cur"},
     "budgets": {"module": "budgets"},
+    "kinesisanalyticsv2": {"module": "kinesisanalyticsv2"},
     "inspector2": {"module": "inspector2"},
     "mq": {"module": "mq"},
     "s3tables": {"module": "s3tables"},
@@ -882,6 +884,7 @@ def _handle_health_request(path: str, request_id: str):
         json.dumps(
             {
                 "services": {s: "available" for s in SERVICE_HANDLERS},
+                "auth": "enabled" if AUTH else "disabled",
                 "edition": os.environ.get("MINISTACK_EDITION", "light"),
                 "version": _version(),
                 "iot_mtls": _iot_mtls_state,
@@ -1555,10 +1558,71 @@ async def _handle_post_body_shortcuts(
 # ---------------------------------------------------------------------------
 
 
-async def _handle_s3_control_request(path: str, method: str, body: bytes, query_params: dict, request_id: str):
+_S3_CONTROL_MRAP_PREFIXES = ("/v20180820/mrap/", "/v20180820/async-requests/mrap/")
+
+
+def _s3control_mrap_arn(s3, path: str) -> str:
+    """IAM resource for an MRAP request: ``arn:aws:s3::<account>:accesspoint/<alias>``
+    for an existing MRAP named in the path, else the account's wildcard."""
+    from ministack.core.responses import get_account_id
+
+    account = get_account_id()
+    ref = unquote(path).rstrip("/").removeprefix("/v20180820/mrap/instances").strip("/")
+    ref = ref.removesuffix("/routes").removesuffix("/policy")
+    record = s3.find_mrap(ref) if ref and not path.startswith("/v20180820/async-requests/") else None
+    return f"arn:aws:s3::{account}:accesspoint/{record['Alias'] if record else '*'}"
+
+
+def _s3control_access_point_arn(s3, path: str) -> str:
+    """IAM resource for an access point request: its regional ARN, or the
+    account's wildcard for ListAccessPoints."""
+    name = unquote(path).rstrip("/").removeprefix("/v20180820/accesspoint").strip("/").removesuffix("/policy")
+    return s3.access_point_arn(name or "*")
+
+
+def _s3control_object_lambda_arn(s3, path: str) -> str:
+    """IAM resource for an Object Lambda Access Point request."""
+    name = unquote(path).rstrip("/").removeprefix("/v20180820/accesspointforobjectlambda").strip("/")
+    return s3.object_lambda_arn(name.split("/", 1)[0] or "*")
+
+
+async def _handle_s3_control_request(path: str, method: str, body: bytes, query_params: dict, request_id: str,
+                                     headers: dict | None = None):
     """Handle S3 Control operations addressed via the /v20180820 path prefix."""
     if not path.startswith(_S3_CONTROL_PREFIX):
         return None
+
+    is_mrap = path.startswith(_S3_CONTROL_MRAP_PREFIXES) or path.rstrip("/") == "/v20180820/mrap/instances"
+    s3 = _get_module("s3")
+    is_object_lambda = s3.is_object_lambda_control_path(path)
+    if is_mrap or is_object_lambda or s3.is_access_point_control_path(path):
+        headers = headers or {}
+        if AUTH:
+            from ministack.core.iam_actions import s3control_action
+
+            action = s3control_action(method, path)
+            if action:
+                if is_mrap:
+                    resource = _s3control_mrap_arn(s3, path)
+                elif is_object_lambda:
+                    resource = _s3control_object_lambda_arn(s3, path)
+                else:
+                    resource = _s3control_access_point_arn(s3, path)
+                denied = _enforce_data_plane("s3", action, headers, query_params, request_id,
+                                             resource_arn=resource)
+                if denied:
+                    return denied
+        if is_mrap:
+            handler = s3.handle_mrap_control
+        elif is_object_lambda:
+            handler = s3.handle_object_lambda_control
+        else:
+            handler = s3.handle_access_point_control
+        status, resp_headers, resp_body = (
+            (AUTH and s3.s3control_account_error(headers))
+            or handler(method, path, headers, body, query_params)
+        )
+        return status, {**resp_headers, "x-amzn-requestid": request_id}, resp_body
 
     if path.startswith("/v20180820/tags/"):
         raw_arn = path[len("/v20180820/tags/") :]
@@ -2065,6 +2129,7 @@ async def _handle_alb_request(host: str, path: str, method: str, headers: dict, 
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
 
 
+_ACCESS_POINT_HOST_RE = re.compile(r"^(?P<name>[a-z0-9-]+)-(?P<account>\d{12})$")
 _MRAP_HOST_RE = re.compile(
     r"^([a-z0-9]+\.mrap)\.accesspoint\.s3-global\.amazonaws\.com$", re.IGNORECASE
 )
@@ -2112,12 +2177,46 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
             }
         mrap_path = "/" + mrap_bucket + (path if path != "/" else "/")
         return await _get_module("s3").handle_request(
-            method, mrap_path, headers, body, query_params, signed_path=path
+            method, mrap_path, headers, body, query_params, signed_path=path,
+            enforce_bucket_region=False,
         )
 
     bucket = _extract_s3_vhost_bucket(host)
     if not bucket or _S3_VHOST_EXCLUDE_RE.search(host) or bucket in _NON_S3_VHOST_NAMES:
         return None
+    # An access point ARN is addressed as `<name>-<account>.<host>`, signed `s3`.
+    access_point_region = None
+    ap_match = _ACCESS_POINT_HOST_RE.match(bucket)
+    s3 = _get_module("s3")
+    if ap_match and s3.signed_service(headers, query_params) == "s3-object-lambda":
+        # An Object Lambda Access Point ARN, same host shape, signed for Object Lambda.
+        from ministack.services import s3_object_lambda
+
+        record, olap_region, olap_error = s3_object_lambda.resolve_host(
+            ap_match.group("name"), ap_match.group("account"), headers, query_params)
+        if olap_error:
+            return olap_error
+        if AUTH:
+            from ministack.core.iam_actions import s3_object_lambda_action
+
+            action = s3_object_lambda_action(method, path.lstrip("/"), query_params)
+            if action:
+                denied = _enforce_data_plane("s3-object-lambda", action, headers, query_params, "",
+                                             resource_arn=s3.object_lambda_arn(record["Name"], region=olap_region))
+                if denied:
+                    return denied
+        query = urlencode(query_params, doseq=True)
+        url = f"http://{host}{path}" + (f"?{query}" if query else "")
+        return await s3_object_lambda.handle_request(record, olap_region, method, path.lstrip("/"), headers, body,
+                                                     query_params, url)
+    if ap_match and s3.signed_service(headers, query_params) == "s3":
+        target = s3.resolve_access_point_host(ap_match.group("name"), ap_match.group("account"),
+                                              s3._signed_region(headers, query_params))
+        if target is not None:
+            ap_bucket, ap_region, ap_error = target
+            if ap_error:
+                return ap_error
+            bucket, access_point_region = ap_bucket, ap_region
     # CloudFront KVS data-plane clients (boto3 cloudfront-keyvaluestore with
     # inject_host_prefix=False) hit ministack with host=localhost and path
     # prefixed by /key-value-stores/. Host-name exclusion above doesn't fire,
@@ -2171,7 +2270,8 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
         # Pass the original (pre-rewrite) URI as signed_path so a presigned
         # virtual-hosted URL, which signed the canonical URI without the bucket,
         # verifies against what the client actually signed.
-        return await _get_module("s3").handle_request(method, vhost_path, headers, body, query_params, signed_path=path)
+        return await _get_module("s3").handle_request(method, vhost_path, headers, body, query_params, signed_path=path,
+                                                      access_point_region=access_point_region)
     except Exception as e:
         logger.exception("Error handling virtual-hosted S3 request: %s", e)
         from xml.sax.saxutils import escape as _xml_esc
@@ -2276,6 +2376,16 @@ async def _handle_special_data_plane_request(
     client_ip: str = "127.0.0.1",
 ):
     """Handle special-case service entrypoints before the generic router."""
+    # S3 Object Lambda's WriteGetObjectResponse, on any host: its modeled host
+    # prefix `<route>.<host>` doesn't resolve locally, so the route header decides.
+    if method == "POST" and path == "/WriteGetObjectResponse" and headers.get("x-amz-request-route"):
+        from ministack.services import s3_object_lambda
+
+        denied = _enforce_data_plane("s3-object-lambda", "s3-object-lambda:WriteGetObjectResponse",
+                                     headers, query_params, request_id)
+        if denied:
+            return denied
+        return s3_object_lambda.write_get_object_response(headers, body)
     # Iceberg REST catalog — /iceberg/* is served by two catalogs that share the
     # prefix: the Glue Data Catalog (the lakehouse a Glue job and Firehose both
     # write) and S3 Tables. Dispatch between them so a table one writer commits,
@@ -2298,7 +2408,7 @@ async def _handle_special_data_plane_request(
         except Exception as e:
             logger.exception("Error in Iceberg REST catalog: %s", e)
             return 500, {"Content-Type": "application/json"}, json.dumps({"error": str(e)}).encode()
-    if response := await _handle_s3_control_request(path, method, body, query_params, request_id):
+    if response := await _handle_s3_control_request(path, method, body, query_params, request_id, headers):
         return response
     if response := await _handle_rds_data_request(method, path, headers, body, query_params):
         return response
@@ -2561,8 +2671,7 @@ def _unknown_query_error(body: bytes, request_id: str):
         else "The requested action is not valid for this web service."
     )
     msg = msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    # Query-protocol error envelopes carry no <?xml?> declaration on the
-    # real AWS wire (17-region capture sweep, 0/85 declarations).
+    # Query error envelopes carry no <?xml?> declaration (AWS captures).
     xml = (
         '<ErrorResponse xmlns="http://webservices.amazon.com/doc/2010-05-08/">'
         f"<Error><Type>Sender</Type><Code>InvalidAction</Code><Message>{msg}</Message></Error>"

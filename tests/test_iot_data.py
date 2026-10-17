@@ -4409,7 +4409,12 @@ def test_mtls_auth_provisioning_claim_is_held_to_its_templates_topics(tmp_path):
     try:
         _wait_ready(f"http://127.0.0.1:{http_port}/_ministack/ready")
         private = _Broker(http_port, mqtt_port)
-        iot = private.client("iot")
+        iot, iam = private.client("iot"), private.client("iam")
+        iam.create_role(RoleName="provisioning", AssumeRolePolicyDocument=json.dumps({
+            "Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "Principal": {"Service": "iot.amazonaws.com"}, "Action": "sts:AssumeRole"}]}))
+        iam.attach_role_policy(
+            RoleName="provisioning", PolicyArn="arn:aws:iam::aws:policy/service-role/AWSIoTThingsRegistration")
         name = _unique("fleet")
         iot.create_provisioning_template(
             templateName=name,

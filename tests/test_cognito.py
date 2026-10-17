@@ -1706,6 +1706,17 @@ def test_cognito_access_token_must_be_a_signed_access_token_under_auth(monkeypat
     assert call("GetUser", AccessToken=alice["AccessToken"])["Username"] == "alice"
 
 
+def test_cognito_access_token_without_the_admin_scope_is_refused_under_auth(monkeypatch):
+    mod, call = _idp_in_process(monkeypatch, auth=True)
+    pid, cid, sign_in = _password_client_with_users(call, "alice")
+    sub = _decode_jwt_claims(sign_in("alice")["AccessToken"])["sub"]
+    scoped = mod._fake_token(sub, pid, cid, "access", username="alice", scope="openid email")
+    assert call("GetUser", AccessToken=scoped) == (
+        "NotAuthorizedException", "Access Token does not have required scopes")
+    admin = mod._fake_token(sub, pid, cid, "access", username="alice", scope="openid aws.cognito.signin.user.admin")
+    assert call("GetUser", AccessToken=admin)["Username"] == "alice"
+
+
 def test_cognito_sign_out_and_revoke_token_revoke_access_tokens_under_auth(monkeypatch):
     _, call = _idp_in_process(monkeypatch, auth=True)
     pid, cid, sign_in = _password_client_with_users(call, "alice", "bob")
@@ -4671,6 +4682,21 @@ def test_oauth2_token_authorization_code_drops_scopes_the_client_does_not_allow(
     assert _decode_jwt_claims(tokens['access_token'])['scope'] == 'openid email'
 
 
+@pytest.mark.parametrize('scope', ['openid api/admin', 'openid bogus'])
+def test_oauth2_authorize_refuses_a_scope_the_client_does_not_allow(scope):
+    """AWS redirects to the callback with invalid_scope instead of showing the login page."""
+    cognito_idp = make_client('cognito-idp')
+    client = _scoped_code_client(cognito_idp, _SCOPED_CLIENT_SCOPES)
+    query = urllib.parse.urlencode({'response_type': 'code', 'client_id': client['ClientId'],
+                                    'redirect_uri': 'http://localhost:3000/callback', 'scope': scope})
+    status, headers, _ = _get(f'{ENDPOINT}/oauth2/authorize?{query}', follow_redirects=False)
+    assert status == 302
+    location = urllib.parse.urlparse(headers['location'])
+    assert location._replace(query='').geturl() == 'http://localhost:3000/callback'
+    assert urllib.parse.parse_qs(location.query) == {'error': ['invalid_request'],
+                                                      'error_description': ['invalid_scope']}
+
+
 def test_oauth2_refreshed_tokens_keep_the_granted_scopes():
     """Both refresh paths keep the code grant's scopes; API sign-ins keep the admin scope."""
     cognito_idp = make_client('cognito-idp')
@@ -4726,7 +4752,6 @@ def test_oauth2_token_client_credentials():
         'grant_type': 'client_credentials',
         'client_id': client_id,
         'client_secret': client_secret,
-        'scope': 'openid',
     })
 
     assert status == 200
@@ -4750,7 +4775,6 @@ def test_oauth2_token_client_credentials_expires_with_the_client():
         'grant_type': 'client_credentials',
         'client_id': client['ClientId'],
         'client_secret': client['ClientSecret'],
-        'scope': 'openid',
     })
 
     assert status == 200
@@ -4790,6 +4814,26 @@ def test_oauth2_token_client_credentials_carries_granted_scopes(requested, scope
     assert _decode_jwt_claims(json.loads(body)['access_token'])['scope'] == scope
 
 
+@pytest.mark.parametrize('requested,error', [('api/admin', 'invalid_grant'), ('openid', 'invalid_scope')])
+def test_oauth2_token_client_credentials_refuses_scopes_it_cannot_grant(requested, error):
+    """A resource-server scope the client lacks is invalid_grant; a non-custom scope is invalid_scope."""
+    cognito_idp = make_client('cognito-idp')
+    pool_id, _ = _setup_pool_with_user(cognito_idp)
+    cognito_idp.create_resource_server(
+        UserPoolId=pool_id, Identifier='api', Name='api',
+        Scopes=[{'ScopeName': n, 'ScopeDescription': n} for n in ('read', 'admin')],
+    )
+    client = cognito_idp.create_user_pool_client(
+        UserPoolId=pool_id, ClientName='m2m', GenerateSecret=True, AllowedOAuthFlows=['client_credentials'],
+        AllowedOAuthScopes=['api/read'], AllowedOAuthFlowsUserPoolClient=True,
+    )['UserPoolClient']
+    status, _, body = _post_form(f'{ENDPOINT}/oauth2/token', {
+        'grant_type': 'client_credentials', 'client_id': client['ClientId'],
+        'client_secret': client['ClientSecret'], 'scope': requested,
+    })
+    assert (status, json.loads(body)) == (400, {'error': error})
+
+
 def test_oauth2_token_client_auth_basic():
     cognito_idp = make_client('cognito-idp')
     pool_id, client = _setup_pool_with_user(cognito_idp, generate_secret=True)
@@ -4802,7 +4846,6 @@ def test_oauth2_token_client_auth_basic():
         f'{ENDPOINT}/oauth2/token',
         {
             'grant_type': 'client_credentials',
-            'scope': 'openid',
         },
         headers={'Authorization': f'Basic {basic}'},
     )
@@ -9000,6 +9043,21 @@ def test_cognito_update_custom_domain_certificate(cognito_idp):
     assert cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"].get("CustomDomain") == domain
 
 
+def test_cognito_update_custom_domain_without_certificate_is_refused(cognito_idp):
+    """A custom domain update must carry CustomDomainConfig; without it AWS refuses the conversion."""
+    pid = cognito_idp.create_user_pool(PoolName="CustomDomainNoCertPool")["UserPool"]["Id"]
+    domain = _pool_unique_domain(pid, "nocert")
+    cognito_idp.create_user_pool_domain(
+        UserPoolId=pid, Domain=domain, CustomDomainConfig={"CertificateArn": _CUSTOM_CERT_ARN})
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.update_user_pool_domain(UserPoolId=pid, Domain=domain, ManagedLoginVersion=2)
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert exc.value.response["Error"]["Message"] == "Cannot convert custom domain to prefix domain."
+    dd = cognito_idp.describe_user_pool_domain(Domain=domain)["DomainDescription"]
+    assert dd["ManagedLoginVersion"] == 1
+    assert dd["CustomDomainConfig"] == {"CertificateArn": _CUSTOM_CERT_ARN}
+
+
 def test_cognito_prefix_domain_unchanged_by_custom_domain_support(cognito_idp):
     """Regression: no CustomDomainConfig still means a prefix domain that expands."""
     pid = cognito_idp.create_user_pool(PoolName="PrefixDomainPool")["UserPool"]["Id"]
@@ -11056,6 +11114,7 @@ def test_cognito_inbound_federation_trigger_feeds_attribute_mapping(cognito_idp,
     handler = (
         "def handler(event, ctx):\n"
         "    assert event['triggerSource'] == 'InboundFederation_ExternalProvider'\n"
+        "    assert event['userName'] == 'opaque-name-id'\n"
         "    assert event['request']['providerType'] == 'SAML'\n"
         "    assert event['request']['providerName'] == 'TestSAML'\n"
         f"    assert event['request']['attributes']['samlResponse'] == {{'{_INBOUND_EMAIL_CLAIM}': 'raw@example.com'}}\n"
@@ -11090,6 +11149,7 @@ def test_cognito_inbound_federation_trigger_failure_fails_saml_sign_in(cognito_i
 def test_cognito_inbound_federation_trigger_feeds_oidc_attribute_mapping(cognito_idp, lam):
     handler = (
         "def handler(event, ctx):\n"
+        "    assert event['userName'] == 'oidc-sub', event['userName']\n"
         "    assert event['request']['providerType'] == 'OIDC'\n"
         "    assert event['request']['attributes']['idToken']['sub'] == 'oidc-sub'\n"
         "    event['response']['userAttributesToMap'] = {'auth_time': '1700000000', 'email': 'oidc-mapped@example.com'}\n"
@@ -11190,7 +11250,7 @@ def test_cognito_inbound_federation_trigger_missing_function_fails_sign_in(cogni
 def test_cognito_inbound_federation_trigger_map_replaces_idp_attributes(cognito_idp, lam):
     handler = (
         "def handler(event, ctx):\n"
-        "    assert event['userName'] == 'TestSAML_replace-name-id', event['userName']\n"
+        "    assert event['userName'] == 'replace-name-id', event['userName']\n"
         "    event['response']['userAttributesToMap'] = {'given_name': 'Kept'}\n"
         "    return event\n"
     )

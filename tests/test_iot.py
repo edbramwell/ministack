@@ -540,8 +540,6 @@ _NO_PRINCIPAL = "because the principal does not exist in your account"
     ("describe_thing_group", {"thingGroupName": "{nogroup}"}, "ThingGroup {account}:{nogroup} not found."),
     ("update_thing_group", {"thingGroupName": "{nogroup}", "thingGroupProperties": {}},
      "Group {nogroup} does not exist"),
-    ("create_thing_group", {"thingGroupName": "{nothing}", "parentGroupName": "{nogroup}"},
-     "Cannot create group using non-existing group as parent : {nogroup}"),
     ("list_things_in_thing_group", {"thingGroupName": "{nogroup}"},
      "Cannot find requested thing group for accountId: {account} and thing group name: {nogroup}"),
     ("add_thing_to_thing_group", {"thingGroupName": "{nogroup}", "thingName": "{thing}"},
@@ -603,6 +601,15 @@ def test_iot_not_found_messages(iot_client, operation, kwargs, message):
         iot_client.delete_policy(policyName=policy)
         iot_client.delete_thing_group(thingGroupName=group)
         iot_client.delete_thing(thingName=thing)
+
+
+def test_iot_create_thing_group_with_unknown_parent_is_invalid(iot_client):
+    nogroup = _unique("nogroup")
+    with pytest.raises(ClientError) as ei:
+        iot_client.create_thing_group(thingGroupName=_unique("group"), parentGroupName=nogroup)
+    error = ei.value.response["Error"]
+    assert (ei.value.response["ResponseMetadata"]["HTTPStatusCode"], error["Code"], error["Message"]) == (
+        400, "InvalidRequestException", f"Cannot create group using non-existing group as parent : {nogroup}")
 
 
 def test_iot_update_thing_increments_version(iot_client):
@@ -1701,8 +1708,11 @@ def test_iot_set_default_policy_version_refusals(iot_client):
             err = ei.value.response
             assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
                 status, code, message)
-        with pytest.raises(iot_client.exceptions.ResourceNotFoundException):
+        with pytest.raises(ClientError) as ei:
             iot_client.set_default_policy_version(policyName=_unique("nope"), policyVersionId="1")
+        err = ei.value.response
+        assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+            404, "ResourceNotFoundException", "Policy not found")
         assert iot_client.get_policy(policyName=name)["defaultVersionId"] == "1"
     finally:
         iot_client.delete_policy(policyName=name)
@@ -2780,11 +2790,11 @@ def test_fleet_provisioning_register_thing_refusals_change_nothing():
     reset()
     no_policy = _fleet_template()
     no_policy["Resources"]["policy"]["Properties"]["PolicyName"] = "fleet-none"
-    sub = _fleet_template()
-    sub["Resources"]["thing"]["Properties"]["ThingName"] = {"Fn::Sub": "fleet-${SerialNumber}"}
+    select = _fleet_template()
+    select["Resources"]["thing"]["Properties"]["ThingName"] = {"Fn::Select": [5, ["fleet-a"]]}
     templates = {
         "fleet": _fleet_template(), "fleet-cdk": _fleet_cdk_template({}),
-        "fleet-nopol": no_policy, "fleet-sub": sub,
+        "fleet-nopol": no_policy, "fleet-select": select,
     }
 
     async def _run():
@@ -2831,15 +2841,12 @@ def test_fleet_provisioning_register_thing_refusals_change_nothing():
             reply, "fleet-nopol",
             "Register thing workflow execution terminates due to: Policy default version not found",
         )
-        reply = await _fleet_publish(
-            session, sent, _fleet_provision_topic("fleet-sub"),
+        topic, doc = await _fleet_publish(
+            session, sent, _fleet_provision_topic("fleet-select"),
             _fleet_register(token, SerialNumber="SN4"),
         )
-        assert reply == _fleet_rejection(
-            "fleet-sub", "InvalidTemplate",
-            "Template fleet-sub uses Fn::Sub, which MiniStack does not resolve.",
-        )
-        for name in ("fleet-c", "fleet-SN2", "fleet-SN3", "fleet-SN4"):
+        assert (topic.rsplit("/", 1)[1], doc["errorCode"]) == ("rejected", "InvalidTemplate")
+        for name in ("fleet-c", "fleet-SN2", "fleet-SN3", "fleet-SN4", "fleet-a"):
             assert await _fleet_thing(name) is None
         assert await _fleet_certificate_state(created["certificateId"]) == (
             "PENDING_ACTIVATION", [], [],
@@ -3254,6 +3261,148 @@ def test_fleet_provisioning_claims_and_tokens_are_scoped_persisted_and_expire():
             _fleet_register(token, SerialNumber="SN1"),
         )
         assert reply[1]["errorCode"] == "InvalidCertificateOwnershipToken"
+        await session.cleanup()
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        reset()
+
+
+def test_fleet_provisioning_resolves_the_documented_intrinsics_and_policy_documents():
+    """Fn::FindInMap, Fn::Split, Fn::Select and Fn::Sub resolve; a PolicyDocument policy is created; no token is "empty"."""
+    import hashlib
+
+    from ministack.services import iot as iot_module
+
+    iot_module.reset()
+    reset()
+    document = {"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "iot:Publish", "Resource": "*"}]}
+    body = _fleet_template(
+        Mappings={"Sites": {"vienna": {"Url": "https://example.com/vie"}}},
+        DeviceConfiguration={
+            "url": {"Fn::FindInMap": ["Sites", {"Ref": "Site"}, "Url"]},
+            "zone": {"Fn::Select": [1, {"Fn::Split": [",", "a,b,c"]}]},
+            "literal": {"Fn::Sub": "${!Keep}"},
+        },
+    )
+    body["Parameters"]["Site"] = {"Type": "String"}
+    body["Resources"]["thing"]["Properties"]["ThingName"] = {
+        "Fn::Sub": ["${Prefix}-${SerialNumber}", {"Prefix": "fleet"}]}
+    body["Resources"]["policy"] = {"Type": "AWS::IoT::Policy", "Properties": {"PolicyDocument": document}}
+
+    async def _run():
+        await _fleet_setup({"fleet": body})
+        session, sent = await _fleet_client("fleet-claim", ["fleet"])
+        created = await _fleet_certificate(session, sent)
+        provision = _fleet_provision_topic("fleet")
+        for token in (None, ""):
+            reply = await _fleet_publish(session, sent, provision, _fleet_register(token, SerialNumber="SN1"))
+            assert reply == _fleet_rejection(
+                "fleet", "InvalidCertificateOwnershipToken", "Certificate ownership token cannot be empty."
+            )
+        reply = await _fleet_publish(session, sent, provision, _fleet_register(
+            created["certificateOwnershipToken"], SerialNumber="SN1", Site="vienna"))
+        assert reply == (f"{provision}/accepted", {
+            "deviceConfiguration": {"url": "https://example.com/vie", "zone": "b", "literal": "${Keep}"},
+            "thingName": "fleet-SN1",
+        })
+        policy = hashlib.sha256(json.dumps(document).encode()).hexdigest()
+        assert await _fleet_certificate_state(created["certificateId"]) == ("ACTIVE", [policy], ["fleet-SN1"])
+        await session.cleanup()
+
+    try:
+        asyncio.run(_run())
+    finally:
+        iot_module.reset()
+        reset()
+
+
+@pytest.mark.parametrize("trust,policies,accepted", [
+    (None, [], False),
+    ({"Service": "lambda.amazonaws.com"}, ["service-role/AWSIoTThingsRegistration"], False),
+    ({"Service": "iot.amazonaws.com"}, [], False),
+    ({"Service": "iot.amazonaws.com"}, ["service-role/AWSIoTThingsRegistration"], True),
+])
+def test_fleet_provisioning_under_auth_needs_a_certificate_and_a_usable_role(monkeypatch, trust, policies, accepted):
+    """With AUTH=true a session without a certificate may not provision, and RegisterThing needs the provisioning role."""
+    import ministack.app as app_mod
+    from ministack.services import iam as iam_svc
+    from ministack.services import iot as iot_module
+
+    iot_module.reset()
+    reset()
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    role = _FLEET_ROLE.rsplit("/", 1)[1]
+
+    async def _run():
+        await _fleet_setup({"fleet": _fleet_template()})
+        if trust is not None:
+            with iot_module.request_scope(_FLEET_ACCOUNT, _FLEET_REGION):
+                iam_svc._roles[role] = {
+                    "RoleName": role,
+                    "AssumeRolePolicyDocument": json.dumps({"Version": "2012-10-17", "Statement": [
+                        {"Effect": "Allow", "Principal": trust, "Action": "sts:AssumeRole"}]}),
+                    "AttachedPolicies": [f"arn:aws:iam::aws:policy/{p}" for p in policies],
+                }
+        _status, claim = await _fleet_request("POST", "/provisioning-templates/fleet/provisioning-claim")
+
+        anonymous, anonymous_sent = await _fleet_client("fleet-anonymous", ["fleet"])
+        anonymous_sent.clear()
+        assert await anonymous.handle_packet(
+            PKT_PUBLISH, 0x02, _encode_string(_FLEET_CREATE) + struct.pack("!H", 9)
+        ) is False
+        assert _extract_publish_frames(anonymous_sent) == []
+        await anonymous.cleanup()
+
+        session, sent = await _fleet_client("fleet-claim", ["fleet"])
+        session.certificate_id, session.provisioning_template = claim["certificateId"], "fleet"
+        created = await _fleet_certificate(session, sent)
+        provision = _fleet_provision_topic("fleet")
+        reply = await _fleet_publish(session, sent, provision, _fleet_register(
+            created["certificateOwnershipToken"], SerialNumber="SN1"))
+        if accepted:
+            assert reply[0] == f"{provision}/accepted"
+            assert (await _fleet_certificate_state(created["certificateId"]))[0] == "ACTIVE"
+        else:
+            assert reply == (f"{provision}/rejected",
+                             {"statusCode": 403, "errorCode": "AccessDenied", "errorMessage": "Access Denied"})
+            assert await _fleet_thing("fleet-SN1") is None
+            assert await _fleet_certificate_state(created["certificateId"]) == ("PENDING_ACTIVATION", [], [])
+        await session.cleanup()
+
+    try:
+        asyncio.run(_run())
+    finally:
+        with iot_module.request_scope(_FLEET_ACCOUNT, _FLEET_REGION):
+            iam_svc._roles.pop(role, None)
+        iot_module.reset()
+        reset()
+
+
+def test_fleet_provisioning_expired_claim_connection_is_closed_after_the_puback():
+    """A PUBLISH on the connection of an expired claim gets its PUBACK, no reply, and the connection closes."""
+    from ministack.services import iot as iot_module
+
+    iot_module.reset()
+    reset()
+
+    async def _run():
+        await _fleet_setup({"fleet": _fleet_template()})
+        _status, claim = await _fleet_request("POST", "/provisioning-templates/fleet/provisioning-claim")
+        session, sent = await _fleet_client("fleet-claim", ["fleet"])
+        session.certificate_id, session.provisioning_template = claim["certificateId"], "fleet"
+        await _fleet_certificate(session, sent)
+        for record in iot_module._provisioning_claims._data.values():
+            record["expiration"] = time.time() - 1
+        sent.clear()
+        assert await session.handle_packet(
+            PKT_PUBLISH, 0x02, _encode_string(_FLEET_CREATE) + struct.pack("!H", 9)
+        ) is False
+        assert _extract_publish_frames(sent) == []
+        assert [m["bytes"] for m in sent if m.get("bytes")] == [bytes([PKT_PUBACK << 4, 2, 0, 9])]
         await session.cleanup()
 
     try:
@@ -9530,7 +9679,7 @@ def test_iot_job_abort_events():
                           timeoutConfig={"inProgressTimeoutInMinutes": 1})
         await call("POST", "/things/ev-t1/jobs/ev-timeout", {"status": "IN_PROGRESS"}, device=True)
         iot_module._job_executions[("ev-t1", "ev-timeout")]["startedAt"] -= 61_000
-        await call("GET", "/things/ev-t1/jobs/ev-timeout", device=True)
+        await call("GET", "/things/ev-t1/jobs", device=True)
 
     events = _registry_events(calls, enable=("JOB", "JOB_EXECUTION"))
     assert [t for t, _e in events] == [

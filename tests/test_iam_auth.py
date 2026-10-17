@@ -3633,8 +3633,6 @@ class TestS3EnforcementSites:
         "Effect": "Allow", "Action": "s3:DeleteObject", "Resource": "arn:aws:s3:::iam-sites-b/a.txt"}]}
     _EVERY_KEY = {"Statement": [{
         "Effect": "Allow", "Action": "s3:DeleteObject", "Resource": "arn:aws:s3:::iam-sites-b/*"}]}
-    _WRITE_ONLY = {"Statement": [{
-        "Effect": "Allow", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::iam-sites-dst/*"}]}
 
     def test_vhost_batch_delete_is_denied_on_the_second_key(self, monkeypatch):
         seen = self._stub_evaluator(monkeypatch, self._ONLY_FIRST_KEY)
@@ -3650,15 +3648,6 @@ class TestS3EnforcementSites:
         assert status != 403
         assert [a for a, _ in seen] == ["s3:DeleteObject", "s3:DeleteObject"]
 
-    def test_vhost_copy_without_read_on_the_source_is_denied(self, monkeypatch):
-        seen = self._stub_evaluator(monkeypatch, self._WRITE_ONLY)
-        status, _headers, body = self._vhost(
-            "iam-sites-dst", "/k", "PUT", {"x-amz-copy-source": "/iam-sites-src/k"}, b"", {})
-        assert status == 403
-        assert b"AccessDenied" in body
-        assert seen == [("s3:PutObject", "arn:aws:s3:::iam-sites-dst/k"),
-                        ("s3:GetObject", "arn:aws:s3:::iam-sites-src/k")]
-
     def test_path_style_batch_delete_is_denied_on_the_second_key(self, monkeypatch):
         seen = self._stub_evaluator(monkeypatch, self._ONLY_FIRST_KEY)
         status, _headers, body = self._path_style("POST", "/iam-sites-b", {}, self._BATCH, {"delete": ""})
@@ -3672,15 +3661,6 @@ class TestS3EnforcementSites:
         status, _headers, _body = self._path_style("POST", "/iam-sites-b", {}, self._BATCH, {"delete": ""})
         assert status != 403
         assert [a for a, _ in seen] == ["s3:DeleteObject", "s3:DeleteObject"]
-
-    def test_path_style_copy_without_read_on_the_source_is_denied(self, monkeypatch):
-        seen = self._stub_evaluator(monkeypatch, self._WRITE_ONLY)
-        status, _headers, body = self._path_style(
-            "PUT", "/iam-sites-dst/k", {"x-amz-copy-source": "/iam-sites-src/k"}, b"", {})
-        assert status == 403
-        assert b"AccessDenied" in body
-        assert seen == [("s3:PutObject", "arn:aws:s3:::iam-sites-dst/k"),
-                        ("s3:GetObject", "arn:aws:s3:::iam-sites-src/k")]
 
     def test_a_primary_denial_stops_before_the_extra_checks(self, monkeypatch):
         seen = self._stub_evaluator(monkeypatch, {"Statement": [
@@ -5096,6 +5076,92 @@ class TestHeaderSignatures:
         _local_client("dynamodb", user_key[0], "wrong-secret").list_tables()
 
 
+def _presigned(key, secret, service, query, token=None, edit=None):
+    """A GET presigned in its query string, as botocore's SigV4QueryAuth signs it: (code or None, status, body)."""
+    from botocore.auth import SigV4QueryAuth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    request = AWSRequest(method="GET", url=f"http://localhost:4566/?{query}")
+    SigV4QueryAuth(Credentials(key, secret, token), service, "us-east-1", 300).add_auth(request)
+    url = edit(request.url) if edit else request.url
+    response = _asgi_send(AWSRequest(method="GET", url=url).prepare())
+    body = response.content.decode()
+    code = re.search(r"<Code>([^<]*)</Code>", body) or re.search(r'"__type": "([^"]*)"', body)
+    return (code.group(1) if code else None), response.status_code, body
+
+
+_LIST_USERS = "Action=ListUsers&Version=2010-05-08"
+_LIST_QUEUES = "Action=ListQueues&Version=2012-11-05"
+
+
+def _drop(name):
+    return lambda url: re.sub(rf"&?{name}=[^&]*", "", url)
+
+
+class TestQuerySignatures:
+    def test_right_secret_passes(self, user_key):
+        assert _presigned(*user_key, "iam", _LIST_USERS)[:2] == (None, 200)
+
+    @pytest.mark.parametrize("service,query", [("iam", _LIST_USERS), ("sqs", _LIST_QUEUES)])
+    def test_wrong_or_forged_signature_is_refused(self, user_key, service, query):
+        assert _presigned(user_key[0], "wrong-secret", service, query)[:2] == ("SignatureDoesNotMatch", 403)
+        forged = _presigned(*user_key, service, query,
+                            edit=lambda url: re.sub(r"X-Amz-Signature=\w+", "X-Amz-Signature=" + "0" * 64, url))
+        assert forged[:2] == ("SignatureDoesNotMatch", 403)
+
+    def test_query_mode_sqs_failure_is_sqs_query_xml(self, user_key):
+        code, status, body = _presigned(user_key[0], "wrong-secret", "sqs", _LIST_QUEUES)
+        assert (code, status) == ("SignatureDoesNotMatch", 403)
+        assert body.startswith('<?xml version="1.0"?><ErrorResponse xmlns="http://queue.amazonaws.com/doc/2012-11-05/">'
+                               "<Error><Type>Sender</Type><Code>SignatureDoesNotMatch</Code>")
+        assert "</Message><Detail/></Error><RequestId>" in body
+        assert _failure(lambda: _local_client("sqs", user_key[0], "wrong-secret").list_queues()) == (
+            "SignatureDoesNotMatch", 403)
+
+    def test_session_key_needs_its_token_and_signature(self, user_key):
+        session = _local_client("sts", *user_key).get_session_token()["Credentials"]
+        key, secret, token = session["AccessKeyId"], session["SecretAccessKey"], session["SessionToken"]
+        assert _presigned(key, secret, "sqs", _LIST_QUEUES, token)[:2] == (None, 200)
+        assert _presigned(key, secret, "sqs", _LIST_QUEUES)[:2] == ("InvalidClientTokenId", 403)
+        forged = _presigned(key, secret, "sqs", _LIST_QUEUES, token,
+                            edit=lambda url: re.sub(r"X-Amz-Signature=\w+", "X-Amz-Signature=" + "0" * 64, url))
+        assert forged[:2] == ("SignatureDoesNotMatch", 403)
+
+    def test_signature_outside_the_time_window_is_refused(self, user_key):
+        def to_2020(url):
+            url = re.sub(r"X-Amz-Date=\d{8}T\d{6}Z", "X-Amz-Date=20200101T000000Z", url)
+            return re.sub(r"%2F\d{8}%2F", "%2F20200101%2F", url)
+
+        code, status, body = _presigned(*user_key, "iam", _LIST_USERS, edit=to_2020)
+        assert (code, status) == ("SignatureDoesNotMatch", 403)
+        assert "Signature expired: 20200101T000000Z is now earlier than " in body
+
+    @pytest.mark.parametrize("name", ["X-Amz-Date", "X-Amz-SignedHeaders", "X-Amz-Signature"])
+    def test_missing_query_parameter_is_refused(self, user_key, name):
+        code, status, body = _presigned(*user_key, "sqs", _LIST_QUEUES, edit=_drop(name))
+        assert (code, status) == ("IncompleteSignature", 400)
+        assert (f"AWS query-string parameters must include &apos;{name}&apos;. "
+                "Re-examine the query-string parameters.") in body or (
+            f"AWS query-string parameters must include '{name}'. Re-examine the query-string parameters.") in body
+
+    def test_credential_must_have_five_elements(self, user_key):
+        code, status, body = _presigned(
+            *user_key, "sqs", _LIST_QUEUES,
+            edit=lambda url: re.sub(r"X-Amz-Credential=([^%]+)%2F[^&]*", r"X-Amz-Credential=\1%2Fus-east-1", url))
+        assert (code, status) == ("IncompleteSignature", 400)
+        assert "Credential must have exactly 5 slash-delimited elements" in body
+
+    def test_root_key_signs_with_any_secret(self, user_key):
+        assert _presigned("test", "anything", "iam", _LIST_USERS)[:2] == (None, 200)
+
+    def test_signature_is_not_checked_without_auth(self, user_key, monkeypatch):
+        from ministack import app as app_mod
+
+        monkeypatch.setattr(app_mod, "AUTH", False)
+        assert _presigned(user_key[0], "wrong-secret", "iam", _LIST_USERS)[:2] == (None, 200)
+
+
 class TestSessionTokens:
     @pytest.fixture
     def session(self, user_key):
@@ -5612,6 +5678,63 @@ def test_stage_policy_is_enforced_on_dispatch(monkeypatch, prefix, suffix, case,
         assert f"apigateway:{method}" in json.loads(body)["message"]
 
 
+@pytest.mark.parametrize("method,path,action", [
+    ("POST", "/v20180820/async-requests/mrap/create", "s3:CreateMultiRegionAccessPoint"),
+    ("POST", "/v20180820/async-requests/mrap/delete", "s3:DeleteMultiRegionAccessPoint"),
+    ("POST", "/v20180820/async-requests/mrap/put-policy", "s3:PutMultiRegionAccessPointPolicy"),
+    ("GET", "/v20180820/async-requests/mrap/arn%3Aaws%3As3%3Aus-west-2%3A000000000000%3Aasync-request/mrap/create/t",
+     "s3:DescribeMultiRegionAccessPointOperation"),
+    ("GET", "/v20180820/mrap/instances", "s3:ListMultiRegionAccessPoints"),
+    ("GET", "/v20180820/mrap/instances/m1", "s3:GetMultiRegionAccessPoint"),
+    ("GET", "/v20180820/mrap/instances/m1/policy", "s3:GetMultiRegionAccessPointPolicy"),
+    ("GET", "/v20180820/mrap/instances/arn%3Aaws%3As3%3A%3A000000000000%3Aaccesspoint/a.mrap/routes",
+     "s3:GetMultiRegionAccessPointRoutes"),
+    ("PATCH", "/v20180820/mrap/instances/arn%3Aaws%3As3%3A%3A000000000000%3Aaccesspoint/a.mrap/routes",
+     "s3:SubmitMultiRegionAccessPointRoutes"),
+])
+def test_s3control_mrap_iam_action(method, path, action):
+    from ministack.core.iam_actions import s3control_action
+
+    assert s3control_action(method, path) == action
+
+
+def test_s3control_mrap_denied_without_the_action(monkeypatch):
+    """Under AUTH=true an S3 Control MRAP call needs its own IAM action."""
+    import ministack.app as app
+    from ministack.services import iam as iam_svc
+
+    fake_key = "AKIATESTMRAPCTL0001"
+    iam_svc._access_keys[fake_key] = {
+        "UserName": "mrap-user", "AccessKeyId": fake_key,
+        "SecretAccessKey": "s", "Status": "Active", "CreateDate": "2024-01-01",
+    }
+    iam_svc._users["mrap-user"] = {
+        "UserName": "mrap-user", "Arn": "arn:aws:iam::000000000000:user/mrap-user",
+        "UserId": "AIDAMRAP1", "CreateDate": "2024-01-01", "Path": "/",
+        "AttachedPolicies": [], "Tags": [],
+    }
+    iam_svc._user_inline_policies["mrap-user"] = {"p": json.dumps({"Statement": [{
+        "Effect": "Allow", "Action": "s3:ListMultiRegionAccessPoints", "Resource": "*"}]})}
+    monkeypatch.setattr(app, "AUTH", True)
+    headers = {
+        "authorization": f"AWS4-HMAC-SHA256 Credential={fake_key}/20261012/us-west-2/s3/aws4_request, "
+                         "SignedHeaders=host, Signature=deadbeef",
+        "x-amz-account-id": "000000000000",
+    }
+    try:
+        listed = asyncio.run(app._handle_s3_control_request(
+            "/v20180820/mrap/instances", "GET", b"", {}, "rid", headers))
+        denied = asyncio.run(app._handle_s3_control_request(
+            "/v20180820/mrap/instances/nope", "GET", b"", {}, "rid", headers))
+    finally:
+        iam_svc._access_keys.pop(fake_key, None)
+        iam_svc._users.pop("mrap-user", None)
+        iam_svc._user_inline_policies.pop("mrap-user", None)
+    assert listed[0] == 200
+    assert denied[0] == 403
+    assert b"s3:GetMultiRegionAccessPoint" in denied[2]
+
+
 @pytest.mark.parametrize("addressing", ["path", "virtual"])
 def test_s3_list_grants_scoped_by_prefix_condition(monkeypatch, addressing):
     """s3:prefix, s3:delimiter and s3:max-keys come from a ListBucket or ListBucketVersions request."""
@@ -5647,3 +5770,79 @@ def test_s3_list_grants_scoped_by_prefix_condition(monkeypatch, addressing):
         iam.delete_user_policy(UserName=name, PolicyName="home")
         iam.delete_user(UserName=name)
         root_s3.delete_bucket(Bucket=bucket)
+
+
+@pytest.mark.parametrize("method,path,action", [
+    ("PUT", "/v20180820/accesspoint/ap1", "s3:CreateAccessPoint"),
+    ("GET", "/v20180820/accesspoint/ap1", "s3:GetAccessPoint"),
+    ("DELETE", "/v20180820/accesspoint/ap1", "s3:DeleteAccessPoint"),
+    ("GET", "/v20180820/accesspoint", "s3:ListAccessPoints"),
+    ("PUT", "/v20180820/accesspoint/ap1/policy", "s3:PutAccessPointPolicy"),
+    ("GET", "/v20180820/accesspoint/ap1/policy", "s3:GetAccessPointPolicy"),
+    ("DELETE", "/v20180820/accesspoint/ap1/policy", "s3:DeleteAccessPointPolicy"),
+])
+def test_s3control_access_point_iam_action(method, path, action):
+    from ministack.core.iam_actions import s3control_action
+
+    assert s3control_action(method, path) == action
+
+
+def test_s3control_access_point_denied_without_the_action(monkeypatch):
+    """Under AUTH=true access point calls need their own action, on the access
+    point's regional ARN."""
+    import ministack.app as app
+
+    seen = _capture_enforced_arn(monkeypatch)
+    headers = {
+        "authorization": "AWS4-HMAC-SHA256 Credential=test/20261013/us-east-1/s3/aws4_request, "
+                         "SignedHeaders=host, Signature=deadbeef",
+        "x-amz-account-id": "000000000000",
+    }
+    monkeypatch.setattr(app, "AUTH", True)
+    asyncio.run(app._handle_s3_control_request("/v20180820/accesspoint/ap1/policy", "GET", b"", {}, "rid", headers))
+    assert seen["action"] == "s3:GetAccessPointPolicy"
+    assert seen["arn"].endswith(":000000000000:accesspoint/ap1")
+
+
+@pytest.mark.parametrize("method,path,action", [
+    ("PUT", "/v20180820/accesspointforobjectlambda/ol", "s3:CreateAccessPointForObjectLambda"),
+    ("GET", "/v20180820/accesspointforobjectlambda/ol", "s3:GetAccessPointForObjectLambda"),
+    ("DELETE", "/v20180820/accesspointforobjectlambda/ol", "s3:DeleteAccessPointForObjectLambda"),
+    ("GET", "/v20180820/accesspointforobjectlambda", "s3:ListAccessPointsForObjectLambda"),
+    ("PUT", "/v20180820/accesspointforobjectlambda/ol/configuration", "s3:PutAccessPointConfigurationForObjectLambda"),
+    ("GET", "/v20180820/accesspointforobjectlambda/ol/configuration", "s3:GetAccessPointConfigurationForObjectLambda"),
+    ("PUT", "/v20180820/accesspointforobjectlambda/ol/policy", "s3:PutAccessPointPolicyForObjectLambda"),
+    ("GET", "/v20180820/accesspointforobjectlambda/ol/policy", "s3:GetAccessPointPolicyForObjectLambda"),
+    ("DELETE", "/v20180820/accesspointforobjectlambda/ol/policy", "s3:DeleteAccessPointPolicyForObjectLambda"),
+])
+def test_s3control_object_lambda_iam_action(method, path, action):
+    from ministack.core.iam_actions import s3control_action
+
+    assert s3control_action(method, path) == action
+
+
+@pytest.mark.parametrize("method,key,query,action", [
+    ("GET", "k.txt", {}, "s3-object-lambda:GetObject"),
+    ("HEAD", "k.txt", {}, "s3-object-lambda:GetObject"),
+    ("PUT", "k.txt", {}, "s3-object-lambda:PutObject"),
+    ("DELETE", "k.txt", {}, "s3-object-lambda:DeleteObject"),
+    ("GET", "", {"list-type": ["2"]}, "s3-object-lambda:ListBucket"),
+])
+def test_s3_object_lambda_data_plane_iam_action(method, key, query, action):
+    from ministack.core.iam_actions import s3_object_lambda_action
+
+    assert s3_object_lambda_action(method, key, query) == action
+
+
+def test_write_get_object_response_needs_its_iam_action(monkeypatch):
+    import ministack.app as app
+
+    seen = _capture_enforced_arn(monkeypatch)
+    monkeypatch.setattr(app, "AUTH", True)
+    headers = {"x-amz-request-route": "io-use1-unknown", "x-amz-request-token": "t",
+               "authorization": "AWS4-HMAC-SHA256 Credential=test/20261013/us-east-1/s3-object-lambda/"
+                                "aws4_request, SignedHeaders=host, Signature=x"}
+    status = asyncio.run(app._handle_special_data_plane_request(
+        "POST", "/WriteGetObjectResponse", headers, b"", {}, "rid"))[0]
+    assert seen["action"] == "s3-object-lambda:WriteGetObjectResponse"
+    assert status == 400

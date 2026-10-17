@@ -1694,8 +1694,7 @@ def _xml(status, root_tag, inner):
 
 def _error(code, message, status):
     """Build an RDS-style XML error response."""
-    # Real AWS Query-protocol error envelopes carry <Type>Sender|Receiver
-    # </Type> and no <?xml?> declaration (17-region capture sweep).
+    # Query error envelope: <Type> in <Error>, no <?xml?> (AWS captures).
     fault_type = "Sender" if 400 <= status < 500 else "Receiver"
     body = f"""<ErrorResponse xmlns="http://rds.amazonaws.com/doc/2014-10-31/">
     <Error><Type>{fault_type}</Type><Code>{code}</Code><Message>{message}</Message></Error>

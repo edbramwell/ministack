@@ -408,9 +408,7 @@ def _empty(action):
 
 
 def _error(code, message, status=400):
-    # Query-protocol error envelope per real-AWS captures (17-region
-    # sweep): <Type> inside <Error> (Sender for 4xx, Receiver for 5xx)
-    # and no <?xml?> declaration.
+    # Query error envelope: <Type> in <Error>, no <?xml?> (AWS captures).
     body = (
         f'<ErrorResponse xmlns="{NS}">'
         f'<Error><Type>{"Sender" if status < 500 else "Receiver"}</Type>'

@@ -54,6 +54,7 @@ from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import esm_wake, run_reentrant, spawn_background
 from ministack.core.lambda_runtime import (
     DURABLE_ENV_VARS,
+    HOST_PREFIX_ENV,
     INVOKE_DEPTH_BOOTSTRAP,
     INVOKE_DEPTH_ENV,
     INVOKE_DEPTH_HEADER,
@@ -1244,6 +1245,26 @@ def _rewrite_host_for_container(url: str) -> str:
     return url
 
 
+def s3_code_region_message(bucket: str, layer: bool = False) -> str | None:
+    """Lambda reads S3 code from the function's own region. For a bucket homed
+    elsewhere, the message AWS returns (observed 2026-10-12); layers word the
+    S3 part differently from functions. None when the bucket is local or absent."""
+    from ministack.services import s3 as s3_svc
+
+    home = s3_svc.bucket_region(bucket)
+    if home is None or home == get_region():
+        return None
+    s3_message = (f"The bucket is in this region: {home}. Please use this region to retry the request" if layer
+                  else "The bucket you are attempting to access must be addressed using the specified endpoint. "
+                       "Please send all future requests to this endpoint.")
+    return f"Error occurred while GetObject. S3 Error Code: PermanentRedirect. S3 Error Message: {s3_message}"
+
+
+def _s3_code_region_error(bucket: str, layer: bool = False):
+    message = s3_code_region_message(bucket, layer)
+    return error_response_json("InvalidParameterValueException", message, 400) if message else None
+
+
 def _fetch_code_from_s3(bucket: str, key: str, version_id: str | None = None) -> bytes | None:
     """Fetch Lambda code zip from the in-memory S3 service.
 
@@ -2306,6 +2327,9 @@ def _create_function(data: dict):
     elif "ZipFile" in code_data:
         code_zip = base64.b64decode(code_data["ZipFile"])
     elif "S3Bucket" in code_data and "S3Key" in code_data:
+        err = _s3_code_region_error(code_data["S3Bucket"])
+        if err is not None:
+            return err
         code_zip = _fetch_code_from_s3(
             code_data["S3Bucket"],
             code_data["S3Key"],
@@ -2763,6 +2787,9 @@ def _update_code(name: str, data: dict):
     elif "ZipFile" in data:
         code_zip = base64.b64decode(data["ZipFile"])
     elif "S3Bucket" in data and "S3Key" in data:
+        err = _s3_code_region_error(data["S3Bucket"])
+        if err is not None:
+            return err
         code_zip = _fetch_code_from_s3(
             data["S3Bucket"],
             data["S3Key"],
@@ -4472,6 +4499,7 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
     # /opt/bin) — no _LAMBDA_LAYERS_DIRS shim here (the official RIE bootstrap
     # ignores it anyway).
     container_env.update(env_vars)
+    container_env.setdefault(HOST_PREFIX_ENV, "true")
     # Per-invocation durable-execution overlay (no-op when the call isn't
     # inside a durable function).
     container_env.update(_durable_env_overlay())
@@ -5365,6 +5393,7 @@ def _provided_worker_env(config: dict, code_dir: str, port: int) -> dict:
     })
     proc_env.update(execution_credentials(config))
     proc_env.update(env_vars)
+    proc_env.setdefault(HOST_PREFIX_ENV, "true")
     proc_env.update(_durable_env_overlay())
     # Override AWS_ENDPOINT_URL *after* function env vars so Lambda binaries
     # always call back to this MiniStack instance.
@@ -5710,6 +5739,7 @@ def _execute_function_local(func: dict, event: dict, request_id: str) -> dict:
             if endpoint:
                 env["AWS_ENDPOINT_URL"] = endpoint
             env.update(env_vars)
+            env.setdefault(HOST_PREFIX_ENV, "true")
             env.update(_durable_env_overlay())
             # X-Ray active tracing — one-shot subprocess, env is per-invocation
             # so a fresh trace ID per call is safe (unlike the pooled RIE).
@@ -6302,6 +6332,11 @@ def _publish_layer_version(layer_name: str, data: dict):
             "CompatibleArchitectures list length exceeds maximum allowed length of 2.",
             400,
         )
+    content = data.get("Content", {})
+    if "S3Bucket" in content and "S3Key" in content:
+        err = _s3_code_region_error(content["S3Bucket"], layer=True)
+        if err is not None:
+            return err
 
     if layer_name not in _layers:
         _layers[layer_name] = {"versions": [], "next_version": 1}

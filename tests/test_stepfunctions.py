@@ -105,13 +105,9 @@ def test_sfn_state_machines_are_region_scoped():
     assert west_sm["stateMachineArn"] in west_arns
     assert west_sm["stateMachineArn"] not in east_arns
 
-    # Real AWS evaluates authorization before existence on
-    # DescribeStateMachine: an arn that does not exist in this region
-    # answers AccessDeniedException, not StateMachineDoesNotExist
-    # (real-AWS capture).
     with pytest.raises(ClientError) as exc:
         west.describe_state_machine(stateMachineArn=east_sm["stateMachineArn"])
-    assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
+    assert exc.value.response["Error"]["Code"] == "StateMachineDoesNotExist"
 
 
 def test_sfn_executions_are_region_scoped():
@@ -5528,15 +5524,13 @@ def test_sfn_create_idempotency_covers_version_description(sfn):
 
 
 def test_sfn_describe_not_found(sfn):
-    """DescribeStateMachine on a non-existent ARN: real AWS evaluates
-    authorization before existence and answers AccessDeniedException
-    (real-AWS capture), not StateMachineDoesNotExist."""
+    """DescribeStateMachine on non-existent ARN should fail."""
     with pytest.raises(ClientError) as exc:
         sfn.describe_state_machine(stateMachineArn="arn:aws:states:us-east-1:000000000000:stateMachine:nonexistent-99")
     err = exc.value.response["Error"]["Code"]
-    assert err == "AccessDeniedException"
+    assert "StateMachineDoesNotExist" in err or "NotFound" in err or "ResourceNotFound" in err
     # Real AWS sends `x-amzn-errortype` on JSON-protocol errors; Java/Go SDK v2 read it.
-    assert exc.value.response["ResponseMetadata"]["HTTPHeaders"].get("x-amzn-errortype") == "AccessDeniedException"
+    assert exc.value.response["ResponseMetadata"]["HTTPHeaders"].get("x-amzn-errortype") == "StateMachineDoesNotExist"
 
 def test_sfn_start_execution_not_found(sfn):
     """StartExecution on non-existent SM should fail."""

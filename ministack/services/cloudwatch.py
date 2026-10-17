@@ -1935,9 +1935,7 @@ def _error(code, message, status, use_json=False, use_cbor=False):
             {"Content-Type": "application/x-amz-json-1.0", "x-amzn-errortype": code},
             json.dumps({"__type": code, "message": message}).encode(),
         )
-    # Query-protocol error envelope per real-AWS captures (17-region
-    # sweep): <Type> inside <Error> (Sender for 4xx, Receiver for 5xx)
-    # and no <?xml?> declaration.
+    # Query error envelope: <Type> in <Error>, no <?xml?> (AWS captures).
     fault_type = "Sender" if status < 500 else "Receiver"
     body = (
         f'<ErrorResponse xmlns="http://monitoring.amazonaws.com/doc/2010-08-01/">\n'

@@ -26,7 +26,7 @@ from conftest import (
     ENDPOINT,
     LoopProbe,
     concurrent_burst,
-    iam_user,
+    inprocess_iam_user,
     make_probe_lambda,
     patch_endpoint_dns,
     routed_request,
@@ -4995,7 +4995,7 @@ def granted_function(monkeypatch):
 
 
 def test_function_policy_naming_the_user_allows_without_identity_policy(granted_function):
-    key, user = iam_user()
+    key, user = inprocess_iam_user()
     name = granted_function(user)
     assert routed_request(key, "lambda", "GET", f"/2015-03-31/functions/{name}")[0] == 200
     status, _headers, body = routed_request(key, "lambda", "GET", f"/2015-03-31/functions/{name}/configuration")
@@ -5003,7 +5003,7 @@ def test_function_policy_naming_the_user_allows_without_identity_policy(granted_
 
 
 def test_function_policy_applies_to_a_call_naming_the_function_by_arn(granted_function):
-    key, user = iam_user()
+    key, user = inprocess_iam_user()
     name = granted_function(user)
     arn = quote(f"arn:aws:lambda:us-east-1:000000000000:function:{name}", safe="")
     assert routed_request(key, "lambda", "GET", f"/2015-03-31/functions/{arn}")[0] == 200
@@ -5011,10 +5011,10 @@ def test_function_policy_applies_to_a_call_naming_the_function_by_arn(granted_fu
 
 def test_function_policy_naming_the_account_needs_an_identity_policy(granted_function):
     name = granted_function("000000000000")
-    key, _user = iam_user()
+    key, _user = inprocess_iam_user()
     status, _headers, body = routed_request(key, "lambda", "GET", f"/2015-03-31/functions/{name}")
     assert (status, json.loads(body)["__type"]) == (403, "AccessDeniedException")
-    key, _user = iam_user({"Statement": [{"Effect": "Allow", "Action": "lambda:GetFunction", "Resource": "*"}]})
+    key, _user = inprocess_iam_user({"Statement": [{"Effect": "Allow", "Action": "lambda:GetFunction", "Resource": "*"}]})
     assert routed_request(key, "lambda", "GET", f"/2015-03-31/functions/{name}")[0] == 200
 
 
@@ -14911,3 +14911,84 @@ exports.handler = async () => {
     assert json.loads(payload) == {"ok": True}
     expected_logs = ["invoke-console-message", "invoke-stderr-message"]
     assert base64.b64decode(headers["X-Amz-Log-Result"]).decode().splitlines() == expected_logs
+
+
+def _regional(service, region):
+    return boto3.client(service, endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+                        region_name=region, aws_access_key_id="test", aws_secret_access_key="test")
+
+
+_S3_CODE_REDIRECT = ("Error occurred while GetObject. S3 Error Code: PermanentRedirect. S3 Error Message: "
+                     "The bucket you are attempting to access must be addressed using the specified endpoint. "
+                     "Please send all future requests to this endpoint.")
+
+
+@pytest.fixture
+def use1_code_bucket(s3):
+    bucket = f"code-use1-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="fn.zip", Body=_make_zip("def handler(e, c):\n    return 1\n"))
+    yield bucket
+    s3.delete_object(Bucket=bucket, Key="fn.zip")
+    s3.delete_bucket(Bucket=bucket)
+
+
+def test_lambda_s3_code_region_create_and_update(lam, use1_code_bucket):
+    """S3 code must come from a bucket in the function's region (observed on
+    AWS 2026-10-12: eu-west-1 function, us-east-1 bucket)."""
+    euw1 = _regional("lambda", "eu-west-1")
+    name = f"s3-code-region-{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        euw1.create_function(FunctionName=name, Runtime="python3.12", Role=_LAMBDA_ROLE, Handler="index.handler",
+                             Code={"S3Bucket": use1_code_bucket, "S3Key": "fn.zip"})
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+    assert exc.value.response["Error"]["Message"] == _S3_CODE_REDIRECT
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+    euw1.create_function(FunctionName=name, Runtime="python3.12", Role=_LAMBDA_ROLE, Handler="index.handler",
+                         Code={"ZipFile": _make_zip("def handler(e, c):\n    return 0\n")})
+    try:
+        with pytest.raises(ClientError) as exc:
+            euw1.update_function_code(FunctionName=name, S3Bucket=use1_code_bucket, S3Key="fn.zip")
+        assert exc.value.response["Error"]["Message"] == _S3_CODE_REDIRECT
+        # A same-region bucket still works.
+        lam.create_function(FunctionName=f"{name}-use1", Runtime="python3.12", Role=_LAMBDA_ROLE,
+                            Handler="index.handler", Code={"S3Bucket": use1_code_bucket, "S3Key": "fn.zip"})
+        lam.delete_function(FunctionName=f"{name}-use1")
+    finally:
+        euw1.delete_function(FunctionName=name)
+
+
+def test_lambda_s3_code_region_publish_layer_version(use1_code_bucket):
+    euw1 = _regional("lambda", "eu-west-1")
+    layer = f"s3-code-region-{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        euw1.publish_layer_version(LayerName=layer, Content={"S3Bucket": use1_code_bucket, "S3Key": "fn.zip"})
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+    assert exc.value.response["Error"]["Message"] == (
+        "Error occurred while GetObject. S3 Error Code: PermanentRedirect. S3 Error Message: "
+        "The bucket is in this region: us-east-1. Please use this region to retry the request")
+    # The refused publish didn't consume a version number.
+    published = euw1.publish_layer_version(LayerName=layer, Content={"ZipFile": _make_zip("x = 1\n")})
+    assert published["Version"] == 1
+    euw1.delete_layer_version(LayerName=layer, VersionNumber=1)
+
+
+def test_lambda_env_disables_host_prefix_injection_by_default(lam):
+    """WriteGetObjectResponse's host prefix (<route>.<host>) doesn't resolve
+    from inside a Lambda, so boto3 in a handler is told not to inject it
+    unless the function sets the variable itself (#2159)."""
+    code = _make_zip("import os\ndef handler(e, c):\n    return os.environ.get('AWS_DISABLE_HOST_PREFIX_INJECTION')\n")
+    name = f"host-prefix-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(FunctionName=name, Runtime="python3.12", Role=_LAMBDA_ROLE, Handler="index.handler",
+                        Code={"ZipFile": code})
+    own = f"{name}-own"
+    lam.create_function(FunctionName=own, Runtime="python3.12", Role=_LAMBDA_ROLE, Handler="index.handler",
+                        Code={"ZipFile": code},
+                        Environment={"Variables": {"AWS_DISABLE_HOST_PREFIX_INJECTION": "false"}})
+    try:
+        assert json.loads(lam.invoke(FunctionName=name)["Payload"].read()) == "true"
+        assert json.loads(lam.invoke(FunctionName=own)["Payload"].read()) == "false"
+    finally:
+        lam.delete_function(FunctionName=name)
+        lam.delete_function(FunctionName=own)

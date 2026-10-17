@@ -899,7 +899,7 @@ def test_cloudfront_function_update_keeps_the_published_live_stage(cloudfront):
 
 def test_cloudfront_function_development_status_follows_publish_and_association(cloudfront):
     """The DEVELOPMENT stage reports UNPUBLISHED only while it holds changes that
-    were never published, then UNASSOCIATED, or ASSOCIATED while a cache
+    were never published, then UNASSOCIATED, or DEPLOYED while a cache
     behavior references the function. Terraform's aws_cloudfront_function.status
     reads this stage."""
     name = f"fn-status-{_uuid_mod.uuid4().hex[:8]}"
@@ -944,8 +944,8 @@ def test_cloudfront_function_development_status_follows_publish_and_association(
         "Items": [{"FunctionARN": fn_arn, "EventType": "viewer-request"}],
     }
     dist = cloudfront.create_distribution(DistributionConfig=cfg)
-    assert dev_status() == "ASSOCIATED"
-    assert listed_dev_status() == "ASSOCIATED"
+    assert dev_status() == "DEPLOYED"
+    assert listed_dev_status() == "DEPLOYED"
 
     dist_id = dist["Distribution"]["Id"]
     cfg["Enabled"] = False

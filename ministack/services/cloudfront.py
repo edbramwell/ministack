@@ -314,9 +314,7 @@ def _xml_response(root_tag: str, builder_fn, status: int = 200, extra_headers: d
 
 
 def _error(code: str, message: str, status: int) -> tuple:
-    # rest-xml error envelope per real-AWS captures (17-region sweep):
-    # <?xml?> declaration present and <Type> inside <Error> (Sender for
-    # 4xx, Receiver for 5xx).
+    # rest-xml error envelope: <?xml?> declaration and <Type> (AWS captures).
     root = Element("ErrorResponse", xmlns=NS)
     err = SubElement(root, "Error")
     SubElement(err, "Type").text = "Sender" if status < 500 else "Receiver"
@@ -748,12 +746,12 @@ def _function_arns_in(dist):
 def _function_dev_status(fn):
     """DEVELOPMENT-stage Status: UNPUBLISHED until PublishFunction has copied
     the current development version to LIVE (an UpdateFunction since then makes
-    it UNPUBLISHED again), then ASSOCIATED while a distribution's cache behavior
+    it UNPUBLISHED again), then DEPLOYED while a distribution's cache behavior
     references the function and UNASSOCIATED otherwise."""
     if not fn.get("live_etag") or fn.get("published_dev_etag") != fn["dev_etag"]:
         return "UNPUBLISHED"
     if any(fn["arn"] in _function_arns_in(d) for d in _distributions.values()):
-        return "ASSOCIATED"
+        return "DEPLOYED"
     return "UNASSOCIATED"
 
 

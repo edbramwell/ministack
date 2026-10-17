@@ -630,7 +630,12 @@ def _regex_pattern_set_body(rps):
 
 def _create_regex_pattern_set(data):
     name = data.get("Name", "")
+    if not name:
+        return _waf_err("WAFInvalidParameterException", "Name is required")
     scope = _normalize_scope(data.get("Scope", "REGIONAL"))
+    for existing in _values_for_scope(_regex_pattern_sets, scope):
+        if existing["Name"] == name and existing.get("Scope") == scope:
+            return _waf_err("WAFDuplicateItemException", f"A RegexPatternSet with name '{name}' already exists.")
     uid = new_uuid()
     lock_token = new_uuid()
     arn = _regex_pattern_set_arn(name, uid, scope)

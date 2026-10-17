@@ -24,9 +24,9 @@ Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
     ``CreateProvisioningClaim``, and fleet provisioning over MQTT
     (``$aws/certificates/create/json`` and
     ``$aws/provisioning-templates/{name}/provision/json``, after the
-    template's pre-provisioning hook allows it);
-    ``provisioningRoleArn`` is presence-checked but not resolved
-    (MiniStack does not validate IAM role ARNs elsewhere either)
+    template's pre-provisioning hook allows it); with ``AUTH=true``
+    RegisterThing needs a ``provisioningRoleArn`` that IoT may assume and
+    that allows its writes
   - Policies: ``CreatePolicy``, ``CreatePolicyVersion``, ``AttachPolicy``,
     ``DetachPolicy``, etc., plus the deprecated principal-policy family
     (``AttachPrincipalPolicy`` / ``DetachPrincipalPolicy`` /
@@ -529,7 +529,6 @@ _NOT_FOUND_MESSAGES = {
     "ThingType": "Thing Type {account}:{name} not found.",
     "ThingGroup": "ThingGroup {account}:{name} not found.",
     "UpdateThingGroup": "Group {name} does not exist",
-    "CreateThingGroup": "Cannot create group using non-existing group as parent : {name}",
     "ThingGroupMember": "Cannot find requested thing group for accountId: {account} and thing group name: {name}",
     "Certificate": "CertificateId {name} does not exist",
     "CACertificate": "Requested CA Certificate does not exist.",
@@ -1744,7 +1743,9 @@ def _create_thing_group(name: str, payload: dict) -> tuple:
     attr_payload = props.get("attributePayload") or {}
     parent = payload.get("parentGroupName")
     if parent and parent not in _thing_groups:
-        return _error_not_found("CreateThingGroup", parent)
+        return error_response_json(
+            "InvalidRequestException", f"Cannot create group using non-existing group as parent : {parent}", 400
+        )
     record = {
         "thingGroupName": name,
         "thingGroupId": new_uuid(),
@@ -1936,10 +1937,10 @@ async def _remove_thing_from_group(payload: dict) -> tuple:
 #
 # CRUD, CreateProvisioningClaim and the fleet provisioning MQTT API (JSON
 # topics) that applies a template to a certificate created over MQTT, once the
-# template's pre-provisioning hook allows it. provisioningRoleArn is
-# presence-checked but never resolved — MiniStack does
-# not validate IAM role ARNs elsewhere either. A template keeps up to five
-# body versions; Describe and RegisterThing use the default one. Wire shapes and
+# template's pre-provisioning hook allows it; with AUTH=true RegisterThing
+# answers AccessDenied unless provisioningRoleArn names a role IoT may assume
+# that allows every write it makes. Template versions are not
+# modeled: a template always carries defaultVersionId 1. Wire shapes and
 # error messages mirror a live probe of the real service (2026-08-26).
 # ---------------------------------------------------------------------------
 
@@ -2496,6 +2497,10 @@ async def _fleet_register_thing(
         if not template.get("enabled"):
             return _fleet_rejected("InvalidTemplate", f"Template {template_name} is not enabled.")
         token = request.get("certificateOwnershipToken")
+        if token is None or token == "":
+            return _fleet_rejected(
+                "InvalidCertificateOwnershipToken", "Certificate ownership token cannot be empty."
+            )
         record = _ownership_tokens.get(token) if isinstance(token, str) else None
         cert = (
             _certificates.get(record["certificateId"])
@@ -2522,7 +2527,7 @@ async def _fleet_register_thing(
                     "InvalidCertificateOwnershipToken", "Certificate ownership token is invalid."
                 )
         plan = _provisioning_plan(template, parameters, cert["certificateId"])
-        thing_name = await _apply_provisioning_plan(plan, cert)
+        thing_name = await _apply_provisioning_plan(plan, cert, template.get("provisioningRoleArn") or "")
     reply = {"deviceConfiguration": plan["deviceConfiguration"]}
     if thing_name is not None:
         reply["thingName"] = thing_name
@@ -2594,7 +2599,7 @@ def _provisioning_hook_overrides(result: dict) -> dict:
 
 
 def _provisioning_plan(template: dict, parameters: dict, cert_id: str) -> dict:
-    """The template's resources with ``Ref`` and ``Fn::Join`` resolved against the parameters."""
+    """The template's resources with ``Ref`` and the intrinsic functions resolved against the parameters."""
     body = _provisioning_template_body(template)
     body = json.loads(body) if isinstance(body, str) else body
     declared = body.get("Parameters")
@@ -2605,6 +2610,26 @@ def _provisioning_plan(template: dict, parameters: dict, cert_id: str) -> dict:
     }
     values.update(parameters)
     values[_CERTIFICATE_ID_PARAMETER] = cert_id
+    mappings = body.get("Mappings") if isinstance(body.get("Mappings"), dict) else {}
+
+    def invalid(function):
+        return _ProvisioningRejected(
+            "InvalidTemplate", f"Template {template['templateName']} has an invalid {function}."
+        )
+
+    def reference(name):
+        if values.get(name) is None:
+            raise _ProvisioningRejected("InvalidParameters", f"Cannot resolve reference value: {name}")
+        return values[name]
+
+    def substitute(text, variables):
+        def one(match):
+            name = match.group(1)
+            if name.startswith("!"):
+                return "${" + name[1:] + "}"
+            return str(variables[name]) if name in variables else str(reference(name))
+
+        return re.sub(r"\$\{([^}]*)\}", one, text)
 
     def resolve(value):
         if isinstance(value, list):
@@ -2614,24 +2639,46 @@ def _provisioning_plan(template: dict, parameters: dict, cert_id: str) -> dict:
         if len(value) == 1:
             function, argument = next(iter(value.items()))
             if function == "Ref":
-                if values.get(argument) is None:
-                    raise _ProvisioningRejected(
-                        "InvalidParameters", f"Cannot resolve reference value: {argument}"
-                    )
-                return values[argument]
-            if (
-                function == "Fn::Join"
-                and isinstance(argument, list)
-                and len(argument) == 2
-                and isinstance(argument[1], list)
-            ):
-                return str(argument[0]).join(str(resolve(v)) for v in argument[1])
-            if function.startswith("Fn::"):
-                raise _ProvisioningRejected(
-                    "InvalidTemplate",
-                    f"Template {template['templateName']} uses {function}, "
-                    "which MiniStack does not resolve.",
-                )
+                return reference(argument)
+            if not function.startswith("Fn::"):
+                return {function: resolve(argument)}
+            argument = resolve(argument)
+            if function == "Fn::Join":
+                if not (isinstance(argument, list) and len(argument) == 2 and isinstance(argument[1], list)):
+                    raise invalid(function)
+                return str(argument[0]).join(str(v) for v in argument[1])
+            if function == "Fn::Select":
+                if not (isinstance(argument, list) and len(argument) == 2 and isinstance(argument[1], list)):
+                    raise invalid(function)
+                try:
+                    index = int(argument[0])
+                except (TypeError, ValueError):
+                    raise invalid(function) from None
+                if not 0 <= index < len(argument[1]) or argument[1][index] is None:
+                    raise invalid(function)
+                return argument[1][index]
+            if function == "Fn::Split":
+                if not (isinstance(argument, list) and len(argument) == 2
+                        and isinstance(argument[0], str) and isinstance(argument[1], str) and argument[0]):
+                    raise invalid(function)
+                return argument[1].split(argument[0])
+            if function == "Fn::FindInMap":
+                if not (isinstance(argument, list) and len(argument) == 3):
+                    raise invalid(function)
+                found = mappings.get(argument[0])
+                found = found.get(argument[1]) if isinstance(found, dict) else None
+                found = found.get(argument[2]) if isinstance(found, dict) else None
+                if found is None:
+                    raise invalid(function)
+                return found
+            if function == "Fn::Sub":
+                if isinstance(argument, str):
+                    return substitute(argument, {})
+                if (isinstance(argument, list) and len(argument) == 2
+                        and isinstance(argument[0], str) and isinstance(argument[1], dict)):
+                    return substitute(argument[0], argument[1])
+                raise invalid(function)
+            raise invalid(function)
         return {k: resolve(v) for k, v in value.items()}
 
     plan = {"thing": None, "status": "ACTIVE", "policies": []}
@@ -2646,13 +2693,19 @@ def _provisioning_plan(template: dict, parameters: dict, cert_id: str) -> dict:
         elif kind == "AWS::IoT::Certificate":
             plan["status"] = str(properties.get("Status") or "ACTIVE").upper()
         elif kind == "AWS::IoT::Policy":
-            if "PolicyDocument" in properties:
-                raise _ProvisioningRejected(
-                    "InvalidTemplate",
-                    f"Template {template['templateName']} creates a policy from a "
-                    "PolicyDocument, which MiniStack does not support.",
-                )
-            plan["policies"].append(properties.get("PolicyName"))
+            document = properties.get("PolicyDocument")
+            if document is None:
+                plan["policies"].append((properties.get("PolicyName"), None))
+                continue
+            if "PolicyName" in properties:
+                raise invalid("AWS::IoT::Policy")
+            document = document if isinstance(document, str) else json.dumps(document)
+            try:
+                json.loads(document)
+            except ValueError:
+                raise invalid("AWS::IoT::Policy") from None
+            # The developer guide: PolicyName "Defaults to a hash of the policy document".
+            plan["policies"].append((hashlib.sha256(document.encode("utf-8")).hexdigest(), document))
     plan["deviceConfiguration"] = resolve(body.get("DeviceConfiguration") or {})
     return plan
 
@@ -2661,17 +2714,23 @@ def _java_map(attributes: dict) -> str:
     return "{" + ", ".join(f"{k}={v}" for k, v in sorted(attributes.items())) + "}"
 
 
-async def _apply_provisioning_plan(plan: dict, cert: dict) -> str | None:
+async def _apply_provisioning_plan(plan: dict, cert: dict, role_arn: str) -> str | None:
     """Create or update the thing, then activate and attach the certificate; a rejection changes nothing."""
     account = get_account_id()
-    for policy in plan["policies"]:
-        if _policies.get(policy) is None:
+    for policy, document in plan["policies"]:
+        if document is None and _policies.get(policy) is None:
             raise _provisioning_failed(
                 "Register thing workflow execution terminates due to: Policy default version not found"
             )
-    if plan["thing"] is None:
-        name = None
-    else:
+    cert_arn = cert["certificateArn"]
+    requests = [("iot:UpdateCertificate", cert_arn)]
+    for policy, document in plan["policies"]:
+        if document is not None and _policies.get(policy) is None:
+            requests.append(("iot:CreatePolicy", _policy_arn(policy)))
+        requests.append(("iot:AttachPolicy", cert_arn))
+    name = update = None
+    join = leave = []
+    if plan["thing"] is not None:
         properties, overrides = plan["thing"]
         name = properties.get("ThingName")
         if not isinstance(name, str) or not _NAME_RE.match(name):
@@ -2692,32 +2751,79 @@ async def _apply_provisioning_plan(plan: dict, cert: dict) -> str | None:
                 )
         thing = _things.get(name)
         if thing is None:
-            _create_thing(name, {
-                "attributePayload": {"attributes": attributes or {}},
-                "thingTypeName": type_name or None,
-            })
-            join, leave = list(groups or ()), []
+            join = list(groups or ())
+            requests.append(("iot:CreateThing", _thing_arn(name)))
         else:
             update, join, leave = _provisioning_thing_changes(
                 thing, attributes, type_name, groups, overrides
             )
             if update:
-                _update_thing(name, update)
+                requests.append(("iot:UpdateThing", _thing_arn(name)))
+        requests += [("iot:AddThingToThingGroup", _thing_group_arn(g)) for g in join]
+        requests += [("iot:RemoveThingFromThingGroup", _thing_group_arn(g)) for g in leave]
+        requests.append(("iot:AttachThingPrincipal", _thing_arn(name)))
+    if not _provisioning_role_allows(role_arn, requests):
+        raise _ProvisioningRejected("AccessDenied", "Access Denied", 403)
+    if name is not None:
+        if _things.get(name) is None:
+            _create_thing(name, {
+                "attributePayload": {"attributes": attributes or {}},
+                "thingTypeName": type_name or None,
+            })
+        elif update:
+            _update_thing(name, update)
         for group in join:
             await _add_thing_to_group({"thingGroupName": group, "thingName": name})
         for group in leave:
             await _remove_thing_from_group({"thingGroupName": group, "thingName": name})
         thing = _things[name]
-        if cert["certificateArn"] not in thing.setdefault("principals", []):
-            thing["principals"].append(cert["certificateArn"])
+        if cert_arn not in thing.setdefault("principals", []):
+            thing["principals"].append(cert_arn)
             _things[name] = thing
         if thing["thingArn"] not in cert.setdefault("attachedThings", []):
             cert["attachedThings"].append(thing["thingArn"])
     cert["status"] = plan["status"]
     _certificates[cert["certificateId"]] = cert
-    for policy in plan["policies"]:
-        _change_policy_target(policy, cert["certificateArn"], attach=True)
+    for policy, document in plan["policies"]:
+        if document is not None and _policies.get(policy) is None:
+            _create_policy(policy, {"policyDocument": document})
+        _change_policy_target(policy, cert_arn, attach=True)
     return name
+
+
+def _provisioning_role_allows(role_arn: str, requests: list[tuple[str, str]]) -> bool:
+    """Under AUTH=true, whether the template's provisioning role is one IoT may assume and allows every write."""
+    from ministack import app
+
+    if not app.AUTH:
+        return True
+    if not _iot_role_usable(role_arn):
+        return False
+    from ministack.core.iam_evaluator import (
+        EvalContext,
+        _gather_role_policies,
+        _permissions_boundary,
+        evaluate,
+    )
+    from ministack.services import iam as _iam
+
+    account = get_account_id()
+    role_name = role_arn.rsplit("/", 1)[-1]
+    policies = _gather_role_policies(role_name, account)
+    limits = _permissions_boundary(_iam._roles, role_name, account)
+    principal = f"arn:aws:sts::{account}:assumed-role/{role_name}/IoTProvisioning"
+    for action, resource in requests:
+        ctx = EvalContext(
+            principal_arn=principal,
+            principal_type="AssumedRole",
+            principal_account=account,
+            action=action,
+            resource_arn=resource,
+            region=get_region(),
+        )
+        if evaluate(ctx, policies, *limits).decision != "Allow":
+            return False
+    return True
 
 
 def _provisioning_thing_changes(
@@ -3772,7 +3878,7 @@ def _set_default_policy_version(name: str, version_id: str) -> tuple:
         )
     p = _policies.get(name)
     if p is None:
-        return _error_not_found("Policy", name)
+        return error_response_json("ResourceNotFoundException", "Policy not found", 404)
     if version_id not in p["versions"]:
         return error_response_json(
             "ResourceNotFoundException",
@@ -7982,6 +8088,37 @@ _JOB_PRESIGN_SESSION_REUSE_SECONDS = 3600
 _jobs_presign_sessions: dict[tuple[str, str], str] = {}
 
 
+def _iot_role_usable(role_arn: str) -> bool:
+    """Under AUTH=true, whether the role exists in the caller's account and its trust policy lets IoT assume it."""
+    from ministack import app
+
+    if not app.AUTH:
+        return True
+    from ministack.core.iam_evaluator import _action_matches, _service_principal_matches
+    from ministack.services import iam as _iam
+
+    parts = role_arn.split(":", 5)
+    if len(parts) != 6 or parts[4] != get_account_id() or not parts[5].startswith("role/"):
+        return False
+    role = _iam._roles.get(parts[5].rsplit("/", 1)[-1])
+    try:
+        statements = json.loads((role or {}).get("AssumeRolePolicyDocument") or "{}").get("Statement", [])
+    except (ValueError, AttributeError):
+        return False
+    allowed = False
+    for stmt in statements if isinstance(statements, list) else [statements]:
+        if not isinstance(stmt, dict) or not _service_principal_matches(stmt.get("Principal"), "iot.amazonaws.com"):
+            continue
+        actions, not_actions = stmt.get("Action", []), stmt.get("NotAction", [])
+        if not _action_matches("sts:AssumeRole", [actions] if isinstance(actions, str) else actions,
+                               [not_actions] if isinstance(not_actions, str) else not_actions):
+            continue
+        if stmt.get("Effect") == "Deny":
+            return False
+        allowed = allowed or stmt.get("Effect") == "Allow"
+    return allowed
+
+
 def _jobs_presign_session(role_arn: str, expires: int) -> tuple[str, dict]:
     """A session of the presign role, registered with STS, that outlives a URL signed now."""
     from ministack.services import iam as _iam
@@ -8015,7 +8152,7 @@ def _jobs_presigned_document(job: dict) -> str:
     config = job.get("presignedUrlConfig")
     if "${aws:iot:s3-presigned-url" not in document or not (
         isinstance(config, dict) and config.get("roleArn")
-    ):
+    ) or not _iot_role_usable(config["roleArn"]):
         return document
     from ministack.core.sigv4 import (
         build_canonical_query_string,
@@ -10780,6 +10917,11 @@ class _WSSession:
 
     def _publish_allowed(self, topic: str, retain: bool) -> bool:
         """iot:Publish on the topic, and iot:RetainPublish too for a retained message."""
+        from ministack import app
+
+        if app.AUTH and self.certificate_id is None and _parse_fleet_provisioning_topic(topic):
+            # Fleet provisioning writes the registry: under AUTH=true it needs an authenticated device.
+            return False
         resource = f"topic/{topic}"
         return self._policy_allows("iot:Publish", resource) and (
             not retain or self._policy_allows("iot:RetainPublish", resource)
@@ -11065,6 +11207,12 @@ class _WSSession:
                 if self.protocol_version == MQTT_5:
                     await self.send_bytes(_make_disconnect(RC5_NOT_AUTHORIZED))
                 return False
+            if self.provisioning_template is not None and _mtls_claim_scope(self.certificate_id) is None:
+                # AWS acknowledges a PUBLISH on an expired claim's connection, then closes it.
+                _broker_logger.warning("IoT broker: the provisioning claim of %r has expired", self._client_id)
+                if qos == 1 and packet_id is not None:
+                    await self.send_bytes(_make_puback(packet_id))
+                return await self._close_unauthorized()
             if not self._publish_allowed(topic, retain):
                 # MQTT 5 answers a refused QoS 1 PUBLISH with PUBACK 0x87 and
                 # keeps the connection.
